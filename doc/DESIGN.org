@@ -1,0 +1,218 @@
+#+TITLE: GEFS for NetBSD: design
+#+DATE: 2026-09-27
+
+A native NetBSD port of GEFS, the copy-on-write Bε-tree file system from
+9front (Ori Bernstein), as a kernel file system: vfsops and vnode operations,
+UBC for file data, usable as the root file system.  Not FUSE.  Power use is a
+first-class requirement: the target is a laptop whose NVMe drive should stay
+in its low-power states whenever nothing is being written.
+
+Sources: 9front =sys/src/cmd/gefs= at 2096014 (2026-09-26), imported
+unmodified in the first commit; Ori's OpenBSD preview (orib.dev/gefs.diff,
+2026-09-15) as the reference for the BSD kernel glue and the on-disk
+extensions it introduces.  The paper (=doc/gefs.ms=) describes the format and
+the commit protocol.
+
+* Principles
+
+1. *Keep the core close to 9front.*  tree.c, blk.c, cache.c, snap.c, pack.c,
+   hash.c, load.c, ream.c, check.c stay as they are wherever possible, so fixes
+   from upstream can be merged.  They are compiled with GCC's
+   =-fplan9-extensions= (anonymous struct embedding with pointer conversion,
+   which the core uses throughout) against a small compatibility header.
+   Ori's port instead renamed every embedded member; that is a large diff
+   against an upstream that keeps moving.
+2. *One core, two environments.*  The same core files build into the kernel
+   (=sys/fs/gefs=, module or built in) and into userland tools
+   (=newfs_gefs=, =fsck_gefs=, =gefs(8)=, a test harness).  Userland builds on
+   NetBSD and on Linux, which makes the core testable without a kernel.
+3. *Nothing runs when nothing changes.*  No periodic timers, no polling
+   threads, no writes on an idle file system (details below).
+4. *Format compatible with 9front and with Ori's OpenBSD port*: a 9front
+   volume mounts on NetBSD, and plain files and directories written here read
+   back on 9front.  POSIX-only features use the extensions Ori defined, plus
+   the few listed below, all marked in the entry flags so older readers skip
+   them.
+
+* Layout
+
+| path                      | what                                             |
+|---------------------------+--------------------------------------------------|
+| sys/fs/gefs/*.c           | the core, from 9front                            |
+| sys/fs/gefs/p9.h, p9*.c   | Plan 9 compatibility: types, locks, atomics,     |
+|                           | error handling, allocation, printing, time       |
+| sys/fs/gefs/gefs_vfsops.c | mount, unmount, sync, statvfs, vget, fh, root    |
+| sys/fs/gefs/gefs_vnops.c  | vnode operations                                 |
+| sys/fs/gefs/gefs_io.c     | device I/O and the write-back queue              |
+| sys/fs/gefs/gefs_commit.c | the commit protocol and background work          |
+|                           | (from fs.c: sync, sweep, snapshot jobs)          |
+| sys/modules/gefs          | the kernel module                                |
+| sbin/newfs_gefs           | ream (mkfs)                                      |
+| sbin/fsck_gefs            | check                                            |
+| sbin/mount_gefs           | mount helper (snapshot label, options)           |
+| usr.sbin/gefs             | snapshots, retention, sync, df (ioctl)           |
+| tests/                    | userland core tests and VM scripts               |
+
+* Compatibility layer
+
+- Types, =nil=, =nelem=, =USED=, =PACK*=/=UNPACK*= as in Plan 9.
+- =Lock=, =QLock= become adaptive =kmutex_t=; =RWLock= becomes =krwlock_t=;
+  =Rendez= a =kcondvar_t= bound to its QLock.  Plan 9 locks are valid when
+  zeroed and the core relies on that, so each wrapper initializes itself on
+  first use (a flag checked with an atomic load); structures that are freed
+  destroy their locks.  Userland maps them to pthreads.
+- Atomics (=agetl=, =aincl=, =acasp=, ...): the GCC =__atomic= builtins with
+  sequential consistency, which matches Plan 9's.
+- Errors: the core uses =waserror()/error()/nexterror()= (setjmp/longjmp).
+  In the kernel each LWP that enters gefs gets an =Errctx= (allocated once,
+  kept as LWP-specific data, freed at LWP exit) and the kernel's
+  =setjmp(label_t*)/longjmp=.  Rule: every entry from NetBSD into gefs (each
+  VOP, VFS op, thread) sets up its own =waserror()= and turns an error into
+  an errno before returning; no gefs error ever unwinds through a NetBSD
+  frame, and no gefs code throws while holding a NetBSD lock it did not take
+  under its own handler.
+- Allocation: =malloc(9)= with =M_GEFS= (sizes are not known at free).
+  The block cache is one allocation of =cmax= blocks, as in 9front.
+- Printing: kernel =printf=/=snprintf=; the custom verbs (=%B=, =%K=, ...) are
+  only used in debug output and become helper calls.
+- Time: =nsec()= is =getnanotime()= (coarse, no clock read per call).
+- Epochs: 9front keeps one epoch slot per worker proc.  Kernel callers are
+  arbitrary LWPs, so epochs count entrants instead: =epochstart= increments
+  =ecount[epoch]= (and retries if the epoch moved), =epochend= decrements it,
+  and the epoch may advance when the previous epoch's count is zero.  Readers
+  never block writers, as in 9front.
+
+* Threads and concurrency
+
+9front runs dispatch, reader, mutator, sweeper, admin, sync and task procs
+connected by channels.  In the kernel a VOP already runs in the caller's
+context:
+
+- Reads (lookup, getattr, readdir, read/getpages) run in the caller under an
+  epoch, lock-free against writers, as the reader procs did.
+- Mutations take =fs->mutlk=, the lock the mutator and sweeper shared; the
+  mutator proc disappears.  Upserts are batched per operation as in 9front.
+- One kernel thread per file system does long work (the sweeper's jobs:
+  freeing large files after remove or truncate, deleting snapshots, clearing
+  trees) and commits.  It sleeps on a condition variable and runs only when
+  given work.
+- No task proc.  See the commit schedule below.
+
+* I/O and the write-back queue (power)
+
+In 9front, every upsert copies the tree root into a new 16 KiB block and
+queues it for writing at once, the sync procs write whatever is queued
+immediately, and a task proc commits every 5 s (arena headers, both
+superblocks and arena footers, whether or not anything changed) and takes a
+snapshot every minute.  On a laptop that keeps the drive awake.
+
+Here:
+
+- Queued blocks are *not* written until a commit or memory pressure.  The
+  per-arena queues keep their order (generation, then fences, writes and
+  frees, then address).  A block freed before it reaches the disk is already
+  skipped by the queue (=Bfreed=), so most short-lived root and node copies
+  never get written at all.
+- The queue is drained by the commit, by =fsync=, or early when queued blocks
+  pass a high-water mark (a fraction of the cache), or when the cache runs out
+  of clean blocks to reuse.
+- Draining sorts by address and merges adjacent blocks into one transfer
+  (up to MAXPHYS); writes are asynchronous buffers on the device vnode, and
+  barriers are =DIOCCACHESYNC= (FUA for the superblock later, if the
+  controller supports it).
+- Reads are synchronous 16 KiB transfers through gefs's own block cache
+  (tree and log blocks).  File data is cached in UBC instead (below).
+
+* Commits
+
+A commit is 9front's =sync()=, unchanged in its ordering, except:
+
+- *Skipped when clean.*  A global dirty flag is set by any upsert, block
+  allocation or free, deadlist or snapshot change; if nothing is dirty the
+  commit returns without touching the disk.  (9front's version appends a sync
+  barrier to every arena log, so even an idle commit writes.)
+- *Scheduled by NetBSD, not by a timer*: the syncer calls =VFS_SYNC(MNT_LAZY)=
+  on every mounted file system every =syncdelay= seconds (30 by default,
+  the same window FFS uses for metadata), =fsync(2)= and =sync(2)= commit, as
+  does unmount.  With nothing dirty, that call does nothing.
+- Before a commit writes the tree, dirty UBC pages of the file system's vnodes
+  are pushed into it (=VOP_PUTPAGES=), so data and metadata go out in one
+  burst.
+- Automatic snapshots (9front's "retain" schedule) are taken inside a
+  commit, only when the tree changed since the last one; an idle file system
+  takes none.  Without a configured schedule, the NetBSD default is
+  =24@h 7@d= (hourly for a day, daily for a week) rather than 9front's
+  minutely one.
+- =fsync= is a full commit, since gefs has no intent log.
+
+* File data and UBC
+
+NetBSD needs =VOP_GETPAGES=/=VOP_PUTPAGES= for mmap, for exec (and so for a
+root file system), and for a coherent page cache.  File data therefore lives
+in UBC:
+
+- =VOP_READ=/=VOP_WRITE= copy through =ubc_uiomove=.
+- getpages/putpages go through genfs with a logical block map, as NFS does:
+  =VOP_BMAP= maps a file block to itself, and gefs's =VOP_STRATEGY= does the
+  real work by file offset.  A read looks up =Kdat(qid, off)= and reads the
+  data block (a missing key is a hole: zeros).  A write builds whole 16 KiB
+  data blocks (reading the old block first when a page range covers only part
+  of one), hashes them, queues them, and upserts the new =Kdat= pointers
+  together with the size and mtime in one batch; the old blocks go through the
+  usual free/kill path so snapshots keep them.
+- File system block size (=mnt_fs_bshift=) is 14 (16 KiB).
+
+* POSIX semantics and on-disk extensions
+
+| POSIX                   | gefs                                                   |
+|-------------------------+--------------------------------------------------------|
+| inode number            | qid.path                                               |
+| uid, gid                | numeric, as stored (9front maps them to names)         |
+| mode 0777               | mode 0777                                              |
+| setuid/setgid/sticky    | mode bits 0x80000/0x40000/0x10000 (9P2000.u positions) |
+| append-only, nodump     | DMAPPEND, DMTMP (UF_APPEND, UF_NODUMP)                 |
+| mtime, atime            | as stored (ns)                                         |
+| ctime                   | new: flag FCTIME, 8 more bytes; mtime when absent      |
+| symlink                 | flag FSYMLINK (Ori): target stored as file data        |
+| devices, fifos, sockets | flag FDEVNOD (Ori): devt[4] rdev[4] after the entry    |
+| hard links              | flag FREFCNT (Ori) and =Khref= (tag 7, Ori's)          |
+| directory nlink         | 1 (like msdosfs; fts treats it as unknown)             |
+| rename across dirs      | one upsert batch: delete old Kent, insert new Kent,    |
+|                         | move Kup, drop an existing target                      |
+
+Hard links are declared but not implemented in Ori's port.  Here: a file that
+gets a second name moves its attributes into =Khref(qid) → refs[8] Xdir=, and
+its directory entries keep only the qid with FREFCNT set; attribute updates for
+such a file go to the Khref record.  The file's data is freed when the count
+reaches zero.
+
+atime: relatime semantics by default (update only when atime ≤ mtime or older
+than a day), so reading never dirties the file system; =noatime= and a strict
+mode as mount options.
+
+* Snapshots and administration
+
+- =mount -t gefs -o snap=LABEL= mounts a label (default =main=); mutable
+  labels are written, immutable ones mount read-only.
+- =gefs(8)= talks to a mounted file system through ioctls on its root:
+  snapshot, delete, list, retain schedule, sync, df, check.
+- One device can back one mount at a time for now; exposing other snapshots
+  under the mount (9front's dump directory) comes later.
+
+* Root file system and booting
+
+- Phase A: GEFS built into the kernel with =VFS_MOUNTROOT=; the kernel and
+  =boot.cfg= stay on the EFI system partition or a small FFS partition, and
+  the root is gefs (=root on dkN type gefs= or =rootfstype=).
+- Phase B: a read-only gefs reader in libsa (superblock, snapshot tree, label,
+  tree walk with pending messages applied, data blocks), so efiboot can load
+  the kernel from gefs directly.
+
+* Testing
+
+- Userland: ream, load, check and the core's fuzzer (=fuzz.c=) on files, on
+  Linux and NetBSD.
+- VM (NetBSD 11.0 in QEMU): mount/unmount, fsx, extraction of the base sets
+  and pkgsrc, crash tests (kill QEMU during writes, remount, fsck), and power
+  checks: zero disk writes over minutes on an idle mount, and write bursts no
+  more often than the commit schedule while something writes steadily.
