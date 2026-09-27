@@ -359,6 +359,15 @@ gefs_unmount(struct mount *mp, int mntflags)
 			return error;
 	}
 	gefs_work_stop(gm);
+	{
+		long long r, w, f;
+
+		gefsdevstats(gm->gm_fd, &r, &w, &f);
+		printf("gefs: %s unmounted: %lld commits, %lld skipped as clean; "
+		    "device %lld reads, %lld writes, %lld cache flushes\n",
+		    gm->gm_label, (long long)gm->gm_fs->ncommit,
+		    (long long)gm->gm_fs->nskip, r, w, f);
+	}
 	gefs_freefs(gm->gm_fs);
 
 	devvp = gm->gm_devvp;

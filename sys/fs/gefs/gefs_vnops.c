@@ -174,6 +174,55 @@ gefs_lnjob(struct gefsmount *gm, void *v)
 	gefslink(gm->gm_mnt, l->dir, l->name, l->n, l->de);
 }
 
+/*
+ * relatime: a read sets atime when it is not after mtime, or is a day
+ * old.  Lazily: the update rides along with the next commit something
+ * else causes (or unmount), so reading never wakes the disk.
+ */
+static void
+gefs_atimejob(struct gefsmount *gm, void *v)
+{
+	struct gefsnode *gn = v;
+	Dent *de = gn->gn_de;
+	Gattr a;
+
+	gn->gn_atimeq = 0;
+	if(!waserror()){
+		if(!de->gone && !de->orphan){
+			memset(&a, 0, sizeof(a));
+			a.atime = nsec();
+			gefssetattr(gm->gm_mnt, de, &a, Aatime, de->muid);
+		}
+		poperror();
+	}
+	clunkdent(gm->gm_mnt, de);
+	/*
+	 * Not vrele: the last reference would reclaim here, and reclaim
+	 * flushes pages through this very thread.
+	 */
+	vrele_async(gn->gn_vp);
+}
+
+static void
+gefs_readatime(struct vnode *vp)
+{
+	struct gefsnode *gn = VTOGN(vp);
+	Dent *de = gn->gn_de;
+	vlong now;
+
+	if(vp->v_mount->mnt_flag & (MNT_NOATIME | MNT_RDONLY))
+		return;
+	now = nsec();
+	if(de->atime > de->mtime && now - de->atime < 24LL*3600*Nsec)
+		return;
+	if(gn->gn_atimeq)
+		return;
+	gn->gn_atimeq = 1;
+	vref(vp);
+	aincl(&de->ref, 1);
+	gefs_post(GMP(vp), gefs_atimejob, gn);
+}
+
 /* posted, not waited for: a removed file's data goes in the background */
 static void
 gefs_reljob(struct gefsmount *gm, void *v)
@@ -611,7 +660,8 @@ gefs_read(void *v)
 		error = ubc_uiomove(&vp->v_uobj, uio, len, IO_ADV_DECODE(ioflag),
 		    UBC_READ | UBC_PARTIALOK | UBC_VNODE_FLAGS(vp));
 	}
-	/* atime is not written: see doc/DESIGN.org (relatime is later work) */
+	if(error == 0)
+		gefs_readatime(vp);
 	return error;
 }
 

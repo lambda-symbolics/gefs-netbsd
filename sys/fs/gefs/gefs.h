@@ -54,6 +54,7 @@ struct gefsnode {
 	kmutex_t	gn_scanlk;
 	struct Scan	*gn_scan;	/* where the last readdir stopped */
 	off_t		gn_scanoff;
+	volatile int	gn_atimeq;	/* an atime update is queued */
 };
 
 #define VFSTOGEFS(mp)	((struct gefsmount *)(mp)->mnt_data)

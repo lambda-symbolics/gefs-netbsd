@@ -39,9 +39,10 @@ mount(void)
 static void
 unmount(void)
 {
+	/* commit while the label is still mounted, as the kernel does */
+	drainsyncq();
 	clunkdent(mnt, root);
 	clunkmount(mnt);
-	drainsyncq();
 }
 
 static Dent*
@@ -304,6 +305,8 @@ phase4(void)
 	Dent *f;
 
 	mount();
+	CHECK((f = look(root, "hl2")) == nil, "phase 2's removals persisted");
+	clunkdent(mnt, f);
 	CHECK((f = look(root, "doomed")) == nil, "orphan has no name");
 	clunkdent(mnt, f);
 	unmount();
