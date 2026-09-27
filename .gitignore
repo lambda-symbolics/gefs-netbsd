@@ -1,3 +1,4 @@
-usr.sbin/gefs/gefs
 *.o
+tests/sagefs/sagefs
+usr.sbin/gefs/gefs
 usr.sbin/gefs/gefstest

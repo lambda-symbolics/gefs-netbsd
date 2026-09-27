@@ -1,0 +1,52 @@
+--- a/sys/lib/libsa/Makefile
++++ b/sys/lib/libsa/Makefile
+@@ -88,6 +88,7 @@
+ SRCS+=	ustarfs.c
+ SRCS+=	dosfs.c
+ SRCS+=	ext2fs.c
++SRCS+=	gefs.c
+ SRCS+=	minixfs3.c
+ SRCS+=	fnmatch.c
+ # for historic compatibility ufs == ffsv1
+--- a/sys/arch/i386/stand/efiboot/conf.c
++++ b/sys/arch/i386/stand/efiboot/conf.c
+@@ -34,6 +34,9 @@
+ #ifdef SUPPORT_EXT2FS
+ #include <lib/libsa/ext2fs.h>
+ #endif
++#ifdef SUPPORT_GEFS
++#include <lib/libsa/gefs.h>
++#endif
+ #ifdef SUPPORT_MINIXFS3
+ #include <lib/libsa/minixfs3.h>
+ #endif
+@@ -87,6 +90,9 @@
+ #ifdef SUPPORT_DOSFS
+ 	FS_OPS(null),
+ #endif
++#ifdef SUPPORT_GEFS
++	FS_OPS(null),
++#endif
+ };
+ int nfsys = __arraycount(file_system);
+ 
+@@ -105,6 +111,9 @@
+ #ifdef SUPPORT_DOSFS
+ 	FS_OPS(dosfs),
+ #endif
++#ifdef SUPPORT_GEFS
++	FS_OPS(gefs),
++#endif
+ };
+ __CTASSERT(__arraycount(file_system) == __arraycount(file_system_disk));
+ const int nfsys_disk = __arraycount(file_system_disk);
+--- a/sys/arch/i386/stand/efiboot/Makefile.efiboot
++++ b/sys/arch/i386/stand/efiboot/Makefile.efiboot
+@@ -62,6 +62,7 @@
+ CPPFLAGS+= -D"devb2cdb(bno)=(bno)"
+ CPPFLAGS+= -DSUPPORT_DOSFS
+ CPPFLAGS+= -DSUPPORT_EXT2FS
++CPPFLAGS+= -DSUPPORT_GEFS
+ CPPFLAGS+= -DSUPPORT_BOOTP
+ CPPFLAGS+= -DSUPPORT_DHCP
+ CPPFLAGS+= -DSUPPORT_NFS

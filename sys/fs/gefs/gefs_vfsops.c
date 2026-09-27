@@ -410,6 +410,18 @@ gefs_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 		gm = VFSTOGEFS(mp);
 		if(gm == NULL)
 			return EINVAL;
+		if(args->fspec != NULL){
+			/* the same device (the root: its name, for "root_device") */
+			error = namei_simple_user(args->fspec,
+			    NSM_FOLLOW_NOEMULROOT, &devvp);
+			if(error)
+				return error;
+			error = (devvp->v_type != VBLK ||
+			    devvp->v_rdev != gm->gm_gd->gd_dev) ? EINVAL : 0;
+			vrele(devvp);
+			if(error)
+				return error;
+		}
 		error = 0;
 		rw_enter(&gefs_mntlock, RW_WRITER);
 		if(gm->gm_ronly && (mp->mnt_iflag & IMNT_WANTRDWR)){
@@ -422,6 +434,9 @@ gefs_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 				error = gefs_call(gm, gefs_rojob, NULL);
 		}
 		rw_exit(&gefs_mntlock);
+		if(error == 0 && args->fspec != NULL)
+			error = set_statvfs_info(path, UIO_USERSPACE, args->fspec,
+			    UIO_USERSPACE, mp->mnt_op->vfs_name, mp, l);
 		return error;
 	}
 	if(args->fspec == NULL)
