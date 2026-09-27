@@ -115,6 +115,7 @@ void	gefsorphans(Mount*);
 int	gefsreaddir(Mount*, Dent*, Scan*, int (*)(void*, Xdir*), void*);
 int	gefsisempty(Mount*, Dent*);
 int	gefserrno(char*);
+_Noreturn void	gefserr(char*, ...);
 int	gefsxtype(Xdir*);
 
 /* the environment */

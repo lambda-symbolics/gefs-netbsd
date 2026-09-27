@@ -33,9 +33,10 @@ extern ulong	fuzzseed;
 
 #define	PACK8(p,v)	do{(p)[0]=(v);}while(0)
 #define	PACK16(p,v)	do{(p)[0]=(v)>>8;(p)[1]=(v);}while(0)
-#define	PACK32(p,v)	do{(p)[0]=(v)>>24;(p)[1]=(v)>>16;(p)[2]=(v)>>8;(p)[3]=(v);}while(0)
-#define	PACK64(p,v)	do{(p)[0]=(v)>>56;(p)[1]=(v)>>48;(p)[2]=(v)>>40;(p)[3]=(v)>>32;\
-			   (p)[4]=(v)>>24;(p)[5]=(v)>>16;(p)[6]=(v)>>8;(p)[7]=(v);}while(0)
+#define	PACK32(p,v)	do{u32int _v32=(v);(p)[0]=_v32>>24;(p)[1]=_v32>>16;(p)[2]=_v32>>8;(p)[3]=_v32;}while(0)
+/* NetBSD: widened first, as for UNPACK; PACK64(p, int) shifted an int by 56 */
+#define	PACK64(p,v)	do{u64int _v64=(v);(p)[0]=_v64>>56;(p)[1]=_v64>>48;(p)[2]=_v64>>40;(p)[3]=_v64>>32;\
+			   (p)[4]=_v64>>24;(p)[5]=_v64>>16;(p)[6]=_v64>>8;(p)[7]=_v64;}while(0)
 
 void*	emalloc(usize, int);
 Blk*	newdblk(Tree*, vlong, int);

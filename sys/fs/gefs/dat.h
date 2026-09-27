@@ -574,6 +574,15 @@ struct Gefs {
 	vlong	ncommit;	/* NetBSD: commits written */
 	vlong	nskip;		/* NetBSD: commits skipped, nothing dirty */
 	vlong	lastcommit;	/* NetBSD: nsec() of the last commit */
+	Blk	**blkall;	/* NetBSD: every cache block, to free them */
+	/*
+	 * NetBSD: kernel stacks are 12 KiB, so the snapshot functions'
+	 * key/value buffers live here; they only run with mutlk held.
+	 */
+	char	upsnapbuf[4][Kvmax];
+	char	delsnapbuf[4][Kvmax];
+	char	tagsnapbuf[3][Kvmax];
+	char	mergedlbuf[2][Kvmax];
 
 	QLock	mountlk;
 	Aptr	mounts;	/* Mount* */

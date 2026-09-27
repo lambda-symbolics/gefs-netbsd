@@ -22,6 +22,61 @@
 #include <lib/libkern/libkern.h>
 typedef label_t jmp_buf[1];
 #define setjmp(j)	setjmp(j)
+
+/*
+ * Core names the kernel uses (getblk, bufhash, debug), and generic ones
+ * it might: prefixed in the kernel, so the module links into any kernel.
+ */
+#define getblk		gefsgetblk
+#define bufhash		gefsbufhash
+#define debug		gefsdebug
+#define lock		gefs_lock
+#define unlock		gefs_unlock
+#define canlock		gefs_canlock
+#define qlock		gefs_qlock
+#define qunlock		gefs_qunlock
+#define canqlock	gefs_canqlock
+#define rlock		gefs_rlock
+#define runlock		gefs_runlock
+#define canrlock	gefs_canrlock
+#define wlock		gefs_wlock
+#define wunlock		gefs_wunlock
+#define canwlock	gefs_canwlock
+#define rsleep		gefs_rsleep
+#define rwakeup		gefs_rwakeup
+#define rwakeupall	gefs_rwakeupall
+#define print		gefs_print9
+#define fprint		gefs_fprint
+#define error		gefs_error
+#define nexterror	gefs_nexterror
+#define broke		gefs_broke
+#define open		gefs_open9
+#define close		gefs_close9
+#define pread		gefs_pread
+#define pwrite		gefs_pwrite
+#define sysfatal	gefs_sysfatal
+#define exits		gefs_exits
+#define nsec		gefs_nsec
+#define dirfstat	gefs_dirfstat
+#define werrstr		gefs_werrstr
+#define fmtinstall	gefs_fmtinstall
+#define fmtprint	gefs_fmtprint
+#define fmtstrcpy	gefs_fmtstrcpy
+#define seprint		gefs_seprint
+#define snprint		gefs_snprint
+#define vsnprint	gefs_vsnprint
+#define vseprint	gefs_vseprint
+#define smprint		gefs_smprint
+#define strecpy		gefs_strecpy
+#define emalloc		gefs_emalloc
+#define estrdup		gefs_estrdup
+#define enqueue		gefs_enqueue
+#define limbo		gefs_limbo
+#define encodefmt	gefs_encodefmt
+#define checkfs		gefs_checkfs
+#define loadfs		gefs_loadfs
+#define reamfs		gefs_reamfs
+#define growfs		gefs_growfs
 #else
 #include <assert.h>
 #include <errno.h>
@@ -111,8 +166,14 @@ void	p9free(void*);
 
 /* strings */
 char*	strecpy(char*, char*, char*);
+
 #ifdef _KERNEL
-long long	strtoll(const char*, char**, int);
+
+/* the device, through p9kern.c */
+int	open(const char*, int, ...);
+int	close(int);
+ssize_t	pread(int, void*, size_t, off_t);
+ssize_t	pwrite(int, const void*, size_t, off_t);
 #endif
 
 /* formatted printing */

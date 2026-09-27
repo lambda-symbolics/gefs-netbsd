@@ -15,6 +15,9 @@
 #include "fns.h"
 #include "ops.h"
 
+/* a directory entry's key and value fit in this */
+#define Entbuf	(Keymax + Xdirsz + 8)
+
 /* --- directory entries in memory, from fs.c --- */
 
 Dent*
@@ -136,7 +139,7 @@ cname(char *buf, char *name, int n)
 static void
 loadextra(Tree *t, Dent *de)
 {
-	char kbuf[Keymax], vbuf[Kvmax];
+	char kbuf[Keymax], vbuf[Keymax + 16];
 	Kvp kv;
 	Key k;
 
@@ -171,7 +174,7 @@ entdent(Mount *mnt, Tree *t, vlong up, Kvp *kv)
 Dent*
 gefsroot(Mount *mnt)
 {
-	char kbuf[Keymax], kvbuf[Kvmax];
+	char kbuf[Keymax], kvbuf[Entbuf];
 	Dent *de;
 	Tree *t;
 	Kvp kv;
@@ -195,7 +198,7 @@ gefsroot(Mount *mnt)
 static Dent*
 lookup1(Mount *mnt, Tree *t, vlong up, char *name)
 {
-	char kbuf[Keymax], kvbuf[Kvmax];
+	char kbuf[Keymax], kvbuf[Entbuf];
 	Kvp kv;
 	Key k;
 
@@ -209,7 +212,7 @@ lookup1(Mount *mnt, Tree *t, vlong up, char *name)
 static Dent*
 parent(Mount *mnt, Tree *t, Dent *dir)
 {
-	char kbuf[Keymax], kvbuf[Kvmax], *name;
+	char kbuf[Upksz], kvbuf[Upksz + Keymax], *name;
 	vlong up;
 	Kvp kv;
 	Key k;
@@ -257,15 +260,22 @@ gefsisempty(Mount *mnt, Dent *dir)
 {
 	char pfx[Dpfxsz];
 	Tree *t;
-	Scan s;
+	Scan *s;
 	int e;
 
 	t = agetp(&mnt->root);
+	s = emalloc(sizeof(Scan), 1);	/* 1 KiB: not on a kernel stack */
+	if(waserror()){
+		free(s);
+		nexterror();
+	}
 	packdkey(pfx, sizeof(pfx), dir->qid.path, nil);
-	btnewscan(&s, pfx, sizeof(pfx));
-	btenter(t, &s);
-	e = !btnext(&s, &s.kv);
-	btexit(&s);
+	btnewscan(s, pfx, sizeof(pfx));
+	btenter(t, s);
+	e = !btnext(s, &s->kv);
+	btexit(s);
+	poperror();
+	free(s);
 	return e;
 }
 
@@ -276,7 +286,7 @@ gefsisempty(Mount *mnt, Dent *dir)
 int
 gefsancestor(Mount *mnt, Dent *a, Dent *d)
 {
-	char kbuf[Keymax], kvbuf[Kvmax];
+	char kbuf[Upksz], kvbuf[Upksz + Keymax];
 	vlong q;
 	Tree *t;
 	Kvp kv;
@@ -647,22 +657,42 @@ enum {
  * >= 0 the file's size becomes newsize instead of growing to cover the
  * write (for the page cache, which knows the size better).
  */
+/* gefswrite's batch; 2.6 KiB, too much for a kernel stack */
+typedef struct Wbuf Wbuf;
+struct Wbuf {
+	char	sbuf[Wstatmax];
+	char	kbuf[Wbatch][Offksz];
+	char	vbuf[Wbatch][Ptrsz];
+	Bptr	bp[Wbatch];
+	Msg	kv[Wbatch+1];
+};
+
 long
 gefswrite(Mount *mnt, Dent *de, char *s, vlong off, long n, vlong newsize, int uid)
 {
-	char sbuf[Wstatmax], kbuf[Wbatch][Offksz], vbuf[Wbatch][Ptrsz];
-	Bptr bp[Wbatch];
-	Msg kv[Wbatch+1];
 	vlong o, len;
 	long c, w, x;
 	int i, j;
-	char *p;
+	char *p, *sbuf, (*kbuf)[Offksz], (*vbuf)[Ptrsz];
+	Bptr *bp;
+	Msg *kv;
 	Tree *t;
+	Wbuf *wb;
 
 	if(off < 0 || off >= (1LL<<62) - n)
 		error(Ewstatl);
 	if(agetl(&fs->rdonly))
 		error(Erdonly);
+	wb = emalloc(sizeof(Wbuf), 0);
+	if(waserror()){
+		free(wb);
+		nexterror();
+	}
+	sbuf = wb->sbuf;
+	kbuf = wb->kbuf;
+	vbuf = wb->vbuf;
+	bp = wb->bp;
+	kv = wb->kv;
 	w = 0;
 	o = off;
 	c = n;
@@ -681,9 +711,9 @@ gefswrite(Mount *mnt, Dent *de, char *s, vlong off, long n, vlong newsize, int u
 		for(i = 0; c > 0 && i < Wbatch; i++){
 			kv[i].op = Oinsert;
 			kv[i].k = kbuf[i];
-			kv[i].nk = sizeof(kbuf[i]);
+			kv[i].nk = Offksz;
 			kv[i].v = vbuf[i];
-			kv[i].nv = sizeof(vbuf[i]);
+			kv[i].nv = Ptrsz;
 			if(waserror()){
 				if(!agetl(&fs->rdonly))
 					for(j = 0; j < i; j++)
@@ -702,12 +732,11 @@ gefswrite(Mount *mnt, Dent *de, char *s, vlong off, long n, vlong newsize, int u
 		kv[i].nk = de->nk;
 		*p++ = 0;
 		if(newsize >= 0 && c == 0){
-			if(newsize != de->length){
-				sbuf[0] |= Owsize;
-				PACK64(p, newsize);
-				p += 8;
-				de->length = newsize;
-			}
+			/* the page cache set de->length already */
+			sbuf[0] |= Owsize;
+			PACK64(p, newsize);
+			p += 8;
+			de->length = newsize;
 		}else if(o > de->length){
 			sbuf[0] |= Owsize;
 			PACK64(p, o);
@@ -733,6 +762,8 @@ gefswrite(Mount *mnt, Dent *de, char *s, vlong off, long n, vlong newsize, int u
 		if(c == 0)
 			break;
 	}
+	poperror();
+	free(wb);
 	return w;
 }
 
@@ -818,9 +849,13 @@ gefstrunc(Mount *mnt, Dent *de, vlong len, int uid)
 Dent*
 gefscreate(Mount *mnt, Dent *dir, char *name, int n, Gattr *a, char *link, int nlink)
 {
-	char nbuf[Maxname+1], buf[Kvmax], upkbuf[Keymax], upvbuf[Inlmax];
-	char tbuf[16], xkbuf[Keymax], xvbuf[12], dkbuf[Offksz], dvbuf[Ptrsz];
-	Msg mb[6];
+	struct {
+		char	nbuf[Maxname+1], buf[Kvmax], upkbuf[Keymax], upvbuf[Inlmax];
+		char	tbuf[16], xkbuf[Keymax], xvbuf[12], dkbuf[Offksz], dvbuf[Ptrsz];
+		Msg	mb[6];
+	} *cb;		/* 2.4 KiB: not on a kernel stack */
+	char *nbuf, *buf, *upkbuf, *upvbuf, *tbuf, *xkbuf, *xvbuf, *dkbuf, *dvbuf;
+	Msg *mb;
 	Dent *de;
 	Bptr bp;
 	Xdir d;
@@ -829,6 +864,14 @@ gefscreate(Mount *mnt, Dent *dir, char *name, int n, Gattr *a, char *link, int n
 	char *p;
 	vlong now;
 
+	cb = emalloc(sizeof(*cb), 0);
+	if(waserror()){
+		free(cb);
+		nexterror();
+	}
+	nbuf = cb->nbuf; buf = cb->buf; upkbuf = cb->upkbuf; upvbuf = cb->upvbuf;
+	tbuf = cb->tbuf; xkbuf = cb->xkbuf; xvbuf = cb->xvbuf; dkbuf = cb->dkbuf;
+	dvbuf = cb->dvbuf; mb = cb->mb;
 	cname(nbuf, name, n);
 	if(a->type == Glnk && (nlink <= 0 || nlink > Blksz))
 		error(Elength);
@@ -907,21 +950,21 @@ gefscreate(Mount *mnt, Dent *dir, char *name, int n, Gattr *a, char *link, int n
 
 	nm = 0;
 	mb[nm].op = Oinsert;
-	dir2kv(dir->qid.path, &d, &mb[nm], buf, sizeof(buf));
+	dir2kv(dir->qid.path, &d, &mb[nm], buf, Kvmax);
 	nm++;
 	if(d.mode & DMDIR){
 		mb[nm].op = Oinsert;
-		p = packsuper(upkbuf, sizeof(upkbuf), d.qid.path);
+		p = packsuper(upkbuf, Keymax, d.qid.path);
 		mb[nm].k = upkbuf;
 		mb[nm].nk = p - upkbuf;
-		p = packdkey(upvbuf, sizeof(upvbuf), dir->qid.path, d.name);
+		p = packdkey(upvbuf, Inlmax, dir->qid.path, d.name);
 		mb[nm].v = upvbuf;
 		mb[nm].nv = p - upvbuf;
 		nm++;
 	}
 	if(d.flag & GEFS_FDEVNOD){
 		mb[nm].op = Oinsert;
-		xkey(&mb[nm], d.qid.path, Xrdev, xkbuf, sizeof(xkbuf));
+		xkey(&mb[nm], d.qid.path, Xrdev, xkbuf, Keymax);
 		PACK32(xvbuf, d.devt);
 		PACK64(xvbuf+4, d.rdev);
 		mb[nm].v = xvbuf;
@@ -931,14 +974,14 @@ gefscreate(Mount *mnt, Dent *dir, char *name, int n, Gattr *a, char *link, int n
 	if(d.flag & GEFS_FSYMLINK){
 		mb[nm].op = Oinsert;
 		mb[nm].k = dkbuf;
-		mb[nm].nk = sizeof(dkbuf);
+		mb[nm].nk = Offksz;
 		mb[nm].v = dvbuf;
-		mb[nm].nv = sizeof(dvbuf);
+		mb[nm].nv = Ptrsz;
 		writeb(mnt, d.qid.path, &mb[nm], &bp, link, 0, nlink, 0);
 		nm++;
 	}
 	touch(dir, &mb[nm++], tbuf, now);
-	assert(nm <= nelem(mb));
+	assert(nm <= 6);
 	upsert(mnt, mb, nm);
 
 	de = getdent(mnt, dir->qid.path, &d);
@@ -947,6 +990,8 @@ gefscreate(Mount *mnt, Dent *dir, char *name, int n, Gattr *a, char *link, int n
 	poperror();
 	qunlock(&fs->mutlk);
 	epochend(0);
+	poperror();
+	free(cb);
 	epochclean();
 	return de;
 }
@@ -961,15 +1006,26 @@ gefscreate(Mount *mnt, Dent *dir, char *name, int n, Gattr *a, char *link, int n
 void
 gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 {
-	char nbuf[Maxname+1], kbuf[Keymax], kvbuf[Kvmax], upbuf[Upksz], tbuf[16];
-	char obuf[Kvmax];
-	Msg mb[4];
+	struct {
+		char	nbuf[Maxname+1], kbuf[Keymax], kvbuf[Entbuf], upbuf[Upksz];
+		char	tbuf[16], obuf[Kvmax];
+		Msg	mb[4];
+	} *rb;		/* not on a kernel stack */
+	char *nbuf, *kbuf, *kvbuf, *upbuf, *tbuf, *obuf;
+	Msg *mb;
 	Tree *t;
 	Kvp kv;
 	Key k;
 	Xdir d;
 	int nm;
 
+	rb = emalloc(sizeof(*rb), 0);
+	if(waserror()){
+		free(rb);
+		nexterror();
+	}
+	nbuf = rb->nbuf; kbuf = rb->kbuf; kvbuf = rb->kvbuf; upbuf = rb->upbuf;
+	tbuf = rb->tbuf; obuf = rb->obuf; mb = rb->mb;
 	cname(nbuf, name, n);
 	if(agetl(&fs->rdonly))
 		error(Erdonly);
@@ -985,8 +1041,8 @@ gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 	if(de->gone || de->orphan)
 		error(Ephase);
 	t = agetp(&mnt->root);
-	dkey(&k, dir->qid.path, nbuf, kbuf, sizeof(kbuf));
-	if(!btlookup(t, &k, &kv, kvbuf, sizeof(kvbuf)))
+	dkey(&k, dir->qid.path, nbuf, kbuf, Keymax);
+	if(!btlookup(t, &k, &kv, kvbuf, Entbuf))
 		error(Esrch);
 	kv2dir(&kv, &d);
 	if(d.qid.path != de->qid.path)
@@ -1002,7 +1058,7 @@ gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 	mb[nm].nv = 0;
 	nm++;
 	if(de->mode & DMDIR){
-		packsuper(upbuf, sizeof(upbuf), de->qid.path);
+		packsuper(upbuf, Upksz, de->qid.path);
 		mb[nm].op = Oclobber;
 		mb[nm].k = upbuf;
 		mb[nm].nk = Upksz;
@@ -1014,11 +1070,11 @@ gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 		d = de->Xdir;
 		d.name = de->oname;
 		mb[nm].op = Oinsert;
-		dir2kv(Qorphan, &d, &mb[nm], obuf, sizeof(obuf));
+		dir2kv(Qorphan, &d, &mb[nm], obuf, Kvmax);
 		nm++;
 	}
 	touch(dir, &mb[nm++], tbuf, nsec());
-	assert(nm <= nelem(mb));
+	assert(nm <= 4);
 	upsert(mnt, mb, nm);
 	if(de->mode & DMDIR)
 		de->gone = 1;
@@ -1027,7 +1083,7 @@ gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 		de->orphan = 1;
 		de->nlink = 0;
 		de->up = Qorphan;
-		dkey(&k, Qorphan, de->oname, kbuf, sizeof(kbuf));
+		dkey(&k, Qorphan, de->oname, kbuf, Keymax);
 		cpkey(de, &k, de->buf, sizeof(de->buf));
 		de->name = de->buf + 11;
 	}
@@ -1035,6 +1091,8 @@ gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 	wunlock(de);
 	qunlock(&fs->mutlk);
 	epochend(0);
+	poperror();
+	free(rb);
 	epochclean();
 }
 
@@ -1085,7 +1143,7 @@ gefsorphans(Mount *mnt)
 	char pfx[Dpfxsz];
 	Dent *de;
 	Tree *t;
-	Scan s;
+	Scan *s;
 	Xdir d;
 	int n;
 
@@ -1098,17 +1156,24 @@ gefsorphans(Mount *mnt)
 			nexterror();
 		}
 		t = agetp(&mnt->root);
+		s = emalloc(sizeof(Scan), 1);
+		if(waserror()){
+			free(s);
+			nexterror();
+		}
 		packdkey(pfx, sizeof(pfx), Qorphan, nil);
-		btnewscan(&s, pfx, sizeof(pfx));
-		btenter(t, &s);
+		btnewscan(s, pfx, sizeof(pfx));
+		btenter(t, s);
 		de = nil;
-		if(btnext(&s, &s.kv)){
-			kv2dir(&s.kv, &d);
+		if(btnext(s, &s->kv)){
+			kv2dir(&s->kv, &d);
 			de = getdent(mnt, Qorphan, &d);
 			snprint(de->oname, sizeof(de->oname), "%s", d.name);
 			de->orphan = 1;
 		}
-		btexit(&s);
+		btexit(s);
+		poperror();
+		free(s);
 		poperror();
 		epochend(0);
 		if(de == nil)
@@ -1133,14 +1198,25 @@ gefsorphans(Mount *mnt)
 void
 gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Dent *tde)
 {
-	char nbuf[Maxname+1], rnbuf[Kvmax], upbuf[Upksz], tupbuf[Upksz], obuf[Kvmax];
-	char t1[16], t2[16], okbuf[Keymax], kbuf[Keymax];
-	Msg mb[7];
+	struct {
+		char	nbuf[Maxname+1], rnbuf[Kvmax], upbuf[Upksz], tupbuf[Upksz];
+		char	obuf[Kvmax], t1[16], t2[16], okbuf[Keymax];
+		Msg	mb[7];
+	} *nb;		/* 2.7 KiB: not on a kernel stack */
+	char *nbuf, *rnbuf, *upbuf, *tupbuf, *obuf, *t1, *t2, *okbuf;
+	Msg *mb;
 	Xdir nd, od;
 	vlong now;
 	Key k;
 	int nm;
 
+	nb = emalloc(sizeof(*nb), 0);
+	if(waserror()){
+		free(nb);
+		nexterror();
+	}
+	nbuf = nb->nbuf; rnbuf = nb->rnbuf; upbuf = nb->upbuf; tupbuf = nb->tupbuf;
+	obuf = nb->obuf; t1 = nb->t1; t2 = nb->t2; okbuf = nb->okbuf; mb = nb->mb;
 	cname(nbuf, tname, n);
 	if(agetl(&fs->rdonly))
 		error(Erdonly);
@@ -1185,11 +1261,11 @@ gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Den
 	nd.name = nbuf;
 	nd.qid.vers++;
 	mb[nm].op = Oinsert;
-	dir2kv(tdir->qid.path, &nd, &mb[nm], rnbuf, sizeof(rnbuf));
+	dir2kv(tdir->qid.path, &nd, &mb[nm], rnbuf, Kvmax);
 	k = mb[nm].Key;
 	nm++;
 	if(de->mode & DMDIR){
-		packsuper(upbuf, sizeof(upbuf), de->qid.path);
+		packsuper(upbuf, Upksz, de->qid.path);
 		mb[nm].op = Oinsert;
 		mb[nm].k = upbuf;
 		mb[nm].nk = Upksz;
@@ -1199,7 +1275,7 @@ gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Den
 	}
 	if(tde != nil){
 		if(tde->mode & DMDIR){
-			packsuper(tupbuf, sizeof(tupbuf), tde->qid.path);
+			packsuper(tupbuf, Upksz, tde->qid.path);
 			mb[nm].op = Oclobber;
 			mb[nm].k = tupbuf;
 			mb[nm].nk = Upksz;
@@ -1211,14 +1287,14 @@ gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Den
 			od = tde->Xdir;
 			od.name = tde->oname;
 			mb[nm].op = Oinsert;
-			dir2kv(Qorphan, &od, &mb[nm], obuf, sizeof(obuf));
+			dir2kv(Qorphan, &od, &mb[nm], obuf, Kvmax);
 			nm++;
 		}
 	}
 	touch(fdir, &mb[nm++], t1, now);
 	if(tdir != fdir)
 		touch(tdir, &mb[nm++], t2, now);
-	assert(nm <= nelem(mb));
+	assert(nm <= 7);
 	upsert(mnt, mb, nm);
 
 	/* the entries in memory */
@@ -1233,12 +1309,11 @@ gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Den
 			tde->orphan = 1;
 			tde->nlink = 0;
 			tde->up = Qorphan;
-			dkey(&k, Qorphan, tde->oname, okbuf, sizeof(okbuf));
+			dkey(&k, Qorphan, tde->oname, okbuf, Keymax);
 			cpkey(tde, &k, tde->buf, sizeof(tde->buf));
 			tde->name = tde->buf + 11;
 		}
 	}
-	USED(kbuf);
 Done:
 	poperror();
 	if(tde != nil && tde != de)
@@ -1246,6 +1321,8 @@ Done:
 	wunlock(de);
 	qunlock(&fs->mutlk);
 	epochend(0);
+	poperror();
+	free(nb);
 	epochclean();
 }
 

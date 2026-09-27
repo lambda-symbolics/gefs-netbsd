@@ -70,6 +70,16 @@ error(char *fmt, ...)
 	errorv(fmt, ap, 0);
 }
 
+/* error(), under a name NetBSD code can call beside an int error */
+_Noreturn void
+gefserr(char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	errorv(fmt, ap, 0);
+}
+
 _Noreturn void
 nexterror(void)
 {

@@ -233,7 +233,7 @@ splicedl(Dlist *d, Dlist *m)
 static void
 mergedl(vlong merge, vlong gen, vlong bgen)
 {
-	char buf[2][Kvmax];
+	char (*buf)[Kvmax] = fs->mergedlbuf;	/* NetBSD: was on the stack */
 	Dlist *d, *m;
 	Msg msg[2];
 
@@ -293,18 +293,24 @@ reclaimblocks(vlong gen, vlong succ, vlong prev)
 {
 	char pfx[9];
 	Dlist dl;
-	Scan s;
+	Scan *s;
 
+	/* NetBSD: a Scan is 1 KiB, too much for a kernel stack */
+	s = emalloc(sizeof(Scan), 1);
+	if(waserror()){
+		free(s);
+		nexterror();
+	}
 	pfx[0] = Kdlist;
 	PACK64(pfx+1, gen);
-	btnewscan(&s, pfx, sizeof(pfx));
-	btenter(&fs->snap, &s);
+	btnewscan(s, pfx, sizeof(pfx));
+	btenter(&fs->snap, s);
 	while(1){
-		if(!btnext(&s, &s.kv))
+		if(!btnext(s, &s->kv))
 			break;
-		kv2dlist(&s.kv, &dl);
+		kv2dlist(&s->kv, &dl);
 		if(waserror()){
-			btexit(&s);
+			btexit(s);
 			nexterror();
 		}
 		if(succ != -1 && dl.bgen <= prev)
@@ -313,27 +319,29 @@ reclaimblocks(vlong gen, vlong succ, vlong prev)
 			dropdl(dl.gen, dl.bgen, succ);
 		poperror();
 	}
-	btexit(&s);
+	btexit(s);
 	if(succ != -1){
 		pfx[0] = Kdlist;
 		PACK64(pfx+1, succ);
-		btnewscan(&s, pfx, sizeof(pfx));
-		btenter(&fs->snap, &s);
+		btnewscan(s, pfx, sizeof(pfx));
+		btenter(&fs->snap, s);
 		while(1){
-			if(!btnext(&s, &s.kv))
+			if(!btnext(s, &s->kv))
 				break;
-			kv2dlist(&s.kv, &dl);
+			kv2dlist(&s->kv, &dl);
 			if(dl.bgen <= prev)
 				continue;
 			if(waserror()){
-				btexit(&s);
+				btexit(s);
 				nexterror();
 			}
 			dropdl(dl.gen, dl.bgen, succ);
 			poperror();
 		}
-		btexit(&s);
+		btexit(s);
 	}
+	poperror();
+	free(s);
 }
 
 /*
@@ -350,7 +358,7 @@ reclaimblocks(vlong gen, vlong succ, vlong prev)
 int
 delsnap(Tree *t, vlong succ, char *name)
 {
-	char *p, buf[4][Kvmax];
+	char *p, (*buf)[Kvmax] = fs->delsnapbuf;	/* NetBSD: was on the stack */
 	int nm, del;
 	Mount *mnt;
 	Tree *r;
@@ -428,7 +436,7 @@ delsnap(Tree *t, vlong succ, char *name)
 void
 tagsnap(Tree *t, char *name, int flg)
 {
-	char *p, buf[3][Kvmax];
+	char *p, (*buf)[Kvmax] = fs->tagsnapbuf;	/* NetBSD: was on the stack */
 	Tree n, c;
 	Msg m[3];
 	Kvp kv;
@@ -495,7 +503,7 @@ tagsnap(Tree *t, char *name, int flg)
 Tree*
 updatesnap(Tree *o, char *lbl, int flg)
 {
-	char buf[4][Kvmax];
+	char (*buf)[Kvmax] = fs->upsnapbuf;	/* NetBSD: was on the stack */
 	Msg m[4];
 	Tree *t;
 	int i;

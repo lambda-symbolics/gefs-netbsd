@@ -601,12 +601,23 @@ snapcmd(char *old, char *new, int flag)
 void
 clearblocks(Mount *mnt, vlong qpath, vlong off, vlong end)
 {
-	char buf[Kvmax];
-	Msg mb[Kvmax/Offksz];
+	struct {
+		char	buf[Kvmax];
+		Msg	mb[Kvmax/Offksz];
+	} *cb;		/* 2.6 KiB: not on a kernel stack */
+	char *buf;
+	Msg *mb;
 	int nm;
 
 	if(agetl(&fs->rdonly))
 		error(Erdonly);
+	cb = emalloc(sizeof(*cb), 0);
+	if(waserror()){
+		free(cb);
+		nexterror();
+	}
+	buf = cb->buf;
+	mb = cb->mb;
 	nm = 0;
 	off &= ~(Blksz-1);
 	for(; off < end; off += Blksz){
@@ -618,7 +629,7 @@ clearblocks(Mount *mnt, vlong qpath, vlong off, vlong end)
 		PACK64(mb[nm].k+9, off);
 		mb[nm].v = nil;
 		mb[nm].nv = 0;
-		if(++nm >= nelem(mb) || off + Blksz >= end){
+		if(++nm >= Kvmax/Offksz || off + Blksz >= end){
 			qlock(&fs->mutlk);
 			if(waserror()){
 				qunlock(&fs->mutlk);
@@ -631,4 +642,6 @@ clearblocks(Mount *mnt, vlong qpath, vlong off, vlong end)
 			nm = 0;
 		}
 	}
+	poperror();
+	free(cb);
 }
