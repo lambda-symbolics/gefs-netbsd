@@ -216,3 +216,76 @@ mode as mount options.
   and pkgsrc, crash tests (kill QEMU during writes, remount, fsck), and power
   checks: zero disk writes over minutes on an idle mount, and write bursts no
   more often than the commit schedule while something writes steadily.
+
+* Status (2026-09-27, evening)
+
+Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
+
+- The module and a built-in kernel (=files.gefs=) build against the 11.0
+  sources; the module's symbols do not clash with the kernel's.
+- A gefs volume mounts, and takes: all file types (regular, directory,
+  symlink, character and block devices, fifos), hard links, rename across
+  directories and over existing files, removal of open files, truncation,
+  chmod/chown/chflags/utimes, relatime atime, fsync.
+- The kernel source tree (6098 files, 161-way hard links) copies in with
+  tar, diffs clean after remount, deletes, and the space comes back; the
+  checker passes after every step.
+- *Root on gefs*: a kernel with =config netbsd root on ld3d type gefs= boots
+  a full NetBSD 11 userland (2.1 GB copied onto gefs with pax) to multi-user,
+  rc remounts it read-write, a compile runs on it, and it shuts down clean.
+- *Crash*: a hard reset during a 312 MB extraction on the gefs root left a
+  file system that checks clean and mounts at once, holding everything synced
+  before the reset and the part of the extraction the last commit covered.
+- *Power*: an idle mount did no disk I/O in 65 s.  A process appending a line
+  every 2 s caused writes in 2 of 7 ten-second windows (the syncer's 30 s
+  commits), not 35.  Unmount logs the counters, e.g. for the copy of the whole
+  userland: 5 commits, 144086 block writes, 11 cache flushes.
+
+** What the implementation taught
+
+- *12 KiB kernel stacks.*  The core's buffers (Kvmax-sized arrays, Scans) and
+  GCC inlining put btupsert at 2.3 KiB and the snapshot functions at 3.3 KiB;
+  a commit from under a VFS call chain overflowed (double fault).  Fixes:
+  =-fconserve-stack=, the snapshot buffers moved into the Gefs (they run
+  under mutlk), the ops layer's buffers on the heap, and above all 9front's own
+  structure: a mutator thread per mount (all changes, commits, page writes,
+  removed files) and reader threads (page-in), each with an empty stack.
+  VOPs queue the work and wait; lookups, getattr and readdir stay in the
+  caller.
+- *Plan 9 C.*  uchar promotes to unsigned int there, so UNPACK32/64 and PACK64
+  sign-extended or shifted an int by 56 under GCC; fixed in fns.h.  Mount.next
+  shadowed Limbo.next (legal in Plan 9 C, an error in GCC): renamed mnext.
+- *Unlinked but open.*  NetBSD flushes a removed file's pages at reclaim,
+  after the inactive hook freed its entry; the flush then updated a key that
+  no longer existed and the core went read-only.  Removed files' pages are
+  now dropped before the data is freed.
+- *Commit before letting go of a label.*  sync() only snapshots mounted
+  labels; changes made just before clunkmount were lost.
+- *A 9front bug*: wstat truncation to a length that is not a multiple of the
+  block size queued Oclearb messages at unaligned keys, which match nothing:
+  the blocks after the new end stayed (a leak, and old data reappeared when
+  the file grew).  gefstrunc rounds up and zeroes the tail of the last block.
+  To report to Ori.
+
+** Format, as implemented
+
+- Entries stay exactly 9front's (Xdirsz); 9front reads NetBSD volumes.
+- Device nodes: flag GEFS_FDEVNOD, devt and rdev in =Kxattr(qid,
+  "gefs.rdev")= (Ori's port puts them inline, which 9front rejects as
+  corrupt; both layouts are read).
+- Hard links: flag GEFS_FREFCNT on each entry (copies), =Khref(qid) →
+  refs[8] Xdir= holds the truth; statupdate applies Owstat to it.
+- setuid/setgid/sticky at the 9P2000.u mode bits; append-only and nodump as
+  DMAPPEND and DMTMP.
+- Removed-but-open files: =Kent(Qorphan, hex qid)=, freed at last close or
+  at the next mount.
+
+** Next
+
+- Snapshot administration: an ioctl on the root and =gefs snap/rm/ls=.
+- A read-only reader in libsa so efiboot loads the kernel from gefs (today
+  the kernel is read from the ESP or an FFS partition; root is gefs).
+- Frees after deleting much: they wait for lazy follow-up commits (up to
+  Lazymax); commit sooner when a lot is pending.
+- ctime, extended attributes, NFS export (needs a qid index), ACLs.
+- Measure on the laptop: power over hours, NVMe idle states.
