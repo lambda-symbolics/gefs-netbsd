@@ -184,6 +184,28 @@ gefs_unloadjob(struct gefsmount *gm, void *arg)
 	clunkmount(gm->gm_mnt);
 }
 
+/* on the mutator: read-only to read-write (the root, once rc has run fsck) */
+static void
+gefs_rwjob(struct gefsmount *gm, void *arg)
+{
+	USED(arg);
+	if(!(gm->gm_mnt->flag & Lmut))
+		gefserr(Erdonly);
+	aswapl(&fs->rdonly, 0);
+	gm->gm_ronly = 0;
+	gefsorphans(gm->gm_mnt);
+}
+
+/* on the mutator: everything to the disk, then read-only */
+static void
+gefs_rojob(struct gefsmount *gm, void *arg)
+{
+	USED(arg);
+	drainsyncq();
+	aswapl(&fs->rdonly, 1);
+	gm->gm_ronly = 1;
+}
+
 static void
 gefs_commitjob(struct gefsmount *gm, void *arg)
 {
@@ -228,6 +250,7 @@ gefs_mountfs(struct vnode *devvp, struct mount *mp, struct lwp *l,
 	gm->gm_mp = mp;
 	gm->gm_devvp = devvp;
 	gm->gm_ronly = (mp->mnt_flag & MNT_RDONLY) != 0;
+	gm->gm_openmode = gm->gm_ronly ? FREAD : FREAD|FWRITE;
 	strlcpy(gm->gm_label, args->snap[0] ? args->snap : "main",
 	    sizeof(gm->gm_label));
 	gm->gm_fd = gefsdevadd(devvp, (long long)psize * secsize);
@@ -284,12 +307,23 @@ gefs_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 		return 0;
 	}
 	if(mp->mnt_flag & MNT_UPDATE){
-		/* nothing changes on update yet; ro <-> rw needs a remount */
 		gm = VFSTOGEFS(mp);
 		if(gm == NULL)
 			return EINVAL;
-		if(gm->gm_ronly != ((mp->mnt_flag & MNT_RDONLY) != 0))
-			return EOPNOTSUPP;
+		if(gm->gm_ronly && (mp->mnt_iflag & IMNT_WANTRDWR)){
+			/* the root is mounted read-only; rc makes it writable */
+			error = gefs_call(gm, gefs_rwjob, NULL);
+			if(error)
+				return error;
+		}else if(!gm->gm_ronly && (mp->mnt_flag & MNT_RDONLY)){
+			error = vflush(mp, NULLVP,
+			    (mp->mnt_flag & MNT_FORCE) ? FORCECLOSE : 0);
+			if(error)
+				return error;
+			error = gefs_call(gm, gefs_rojob, NULL);
+			if(error)
+				return error;
+		}
 		return 0;
 	}
 	if(args->fspec == NULL)
@@ -373,7 +407,7 @@ gefs_unmount(struct mount *mp, int mntflags)
 	devvp = gm->gm_devvp;
 	spec_node_setmountedfs(devvp, NULL);
 	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-	(void)VOP_CLOSE(devvp, gm->gm_ronly ? FREAD : FREAD|FWRITE, NOCRED);
+	(void)VOP_CLOSE(devvp, gm->gm_openmode, NOCRED);
 	vput(devvp);
 	gefsdevdel(gm->gm_fd);
 	kmem_free(gm, sizeof(*gm));
@@ -544,6 +578,37 @@ gefs_loadvnode(struct mount *mp, struct vnode *vp, const void *key,
 	return 0;
 }
 
+/* the root file system: the kernel opened rootvp for reading */
+static int
+gefs_mountroot(void)
+{
+	struct gefs_args args;
+	struct mount *mp;
+	struct lwp *l = curlwp;
+	int error;
+
+	if(device_class(root_device) != DV_DISK)
+		return ENODEV;
+	if((error = vfs_rootmountalloc(MOUNT_GEFS, "root_device", &mp)) != 0){
+		vrele(rootvp);
+		return error;
+	}
+	memset(&args, 0, sizeof(args));
+	mp->mnt_flag |= MNT_FORCE;
+	if((error = gefs_mountfs(rootvp, mp, l, &args)) != 0){
+		vfs_unbusy(mp);
+		vfs_rele(mp);
+		return error;
+	}
+	mp->mnt_flag &= ~MNT_FORCE;
+	mountlist_append(mp);
+	(void)gefs_statvfs(mp, &mp->mnt_stat);
+	vfs_unbusy(mp);
+	/* for the clock, as FFS gives its superblock time: the root's mtime */
+	setrootfstime((time_t)(VFSTOGEFS(mp)->gm_rootde->mtime / Nsec));
+	return 0;
+}
+
 static int
 gefs_fhtovp(struct mount *mp, struct fid *fhp, int lktype, struct vnode **vpp)
 {
@@ -559,6 +624,11 @@ gefs_vptofh(struct vnode *vp, struct fid *fhp, size_t *fh_size)
 static void
 gefs_init(void)
 {
+#ifndef _MODULE
+	/* built in: no module command to set up the compatibility layer */
+	if(p9kinit() != 0)
+		panic("gefs: p9kinit");
+#endif
 }
 
 static void
@@ -593,6 +663,7 @@ struct vfsops gefs_vfsops = {
 	.vfs_loadvnode = gefs_loadvnode,
 	.vfs_fhtovp = gefs_fhtovp,
 	.vfs_vptofh = gefs_vptofh,
+	.vfs_mountroot = gefs_mountroot,
 	.vfs_init = gefs_init,
 	.vfs_done = gefs_done,
 	.vfs_snapshot = gefs_snapshot,
@@ -611,15 +682,22 @@ gefs_modcmd(modcmd_t cmd, void *arg)
 
 	switch(cmd){
 	case MODULE_CMD_INIT:
+#ifdef _MODULE
 		if((error = p9kinit()) != 0)
 			return error;
-		if((error = vfs_attach(&gefs_vfsops)) != 0)
+#endif
+		if((error = vfs_attach(&gefs_vfsops)) != 0){
+#ifdef _MODULE
 			p9kfini();
+#endif
+		}
 		return error;
 	case MODULE_CMD_FINI:
 		if((error = vfs_detach(&gefs_vfsops)) != 0)
 			return error;
+#ifdef _MODULE
 		p9kfini();
+#endif
 		return 0;
 	default:
 		return ENOTTY;

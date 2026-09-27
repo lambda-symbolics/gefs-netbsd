@@ -540,6 +540,12 @@ gefs_setattr(void *v)
 	memset(&n, 0, sizeof(n));
 	mask = 0;
 	uid = kauth_cred_geteuid(cred);
+	/*
+	 * A size for a device or fifo is ignored, as on FFS: open(2) with
+	 * O_TRUNC sends one, and /dev/null must open on a read-only root.
+	 */
+	if(vap->va_size != VNOVAL && vp->v_type != VREG && vp->v_type != VDIR)
+		vap->va_size = VNOVAL;
 	if((vp->v_mount->mnt_flag & MNT_RDONLY) &&
 	    (vap->va_flags != VNOVAL || vap->va_uid != (uid_t)VNOVAL ||
 	    vap->va_gid != (gid_t)VNOVAL || vap->va_mode != (mode_t)VNOVAL ||

@@ -32,6 +32,7 @@ struct gefsmount {
 	struct Dent	*gm_rootde;
 	int		gm_fd;		/* device slot, p9kern.c */
 	int		gm_ronly;
+	int		gm_openmode;	/* FREAD, or FREAD|FWRITE */
 	char		gm_label[64];
 	/* the mutator and reader threads, gefs_work.c */
 	kmutex_t	gm_jlk;

@@ -1,0 +1,28 @@
+#	GEFS, the copy-on-write Be-tree file system from 9front, for NetBSD.
+#	The core is Plan 9 C: it needs -fplan9-extensions (GCC).
+
+deffs	GEFS
+
+file	fs/gefs/gefs_vfsops.c		gefs
+file	fs/gefs/gefs_vnops.c		gefs
+file	fs/gefs/gefs_work.c		gefs
+file	fs/gefs/p9kern.c		gefs
+file	fs/gefs/p9fmt.c			gefs
+file	fs/gefs/p9err.c			gefs
+file	fs/gefs/avl.c			gefs
+file	fs/gefs/hash.c			gefs
+file	fs/gefs/pack.c			gefs
+file	fs/gefs/blk.c			gefs
+file	fs/gefs/cache.c			gefs
+file	fs/gefs/tree.c			gefs
+file	fs/gefs/snap.c			gefs
+file	fs/gefs/load.c			gefs
+file	fs/gefs/check.c			gefs
+file	fs/gefs/dump.c			gefs
+file	fs/gefs/error.c			gefs
+file	fs/gefs/sync.c			gefs
+file	fs/gefs/ops.c			gefs
+
+makeoptions	gefs	"CPPFLAGS.gefs"+="-I$S/fs/gefs/compat -I$S/fs/gefs"
+makeoptions	gefs	"COPTS.gefs"+="-fplan9-extensions -fconserve-stack"
+makeoptions	gefs	"CWARNFLAGS.gefs"+="-Wno-error -Wno-missing-braces -Wno-parentheses -Wno-sign-compare -Wno-unknown-pragmas -Wno-overflow -Wno-char-subscripts -Wno-missing-prototypes -Wno-strict-prototypes -Wno-unused"
