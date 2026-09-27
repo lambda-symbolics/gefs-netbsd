@@ -38,20 +38,31 @@ the commit protocol.
 
 | path                      | what                                             |
 |---------------------------+--------------------------------------------------|
-| sys/fs/gefs/*.c           | the core, from 9front                            |
-| sys/fs/gefs/p9.h, p9*.c   | Plan 9 compatibility: types, locks, atomics,     |
-|                           | error handling, allocation, printing, time       |
-| sys/fs/gefs/gefs_vfsops.c | mount, unmount, sync, statvfs, vget, fh, root    |
-| sys/fs/gefs/gefs_vnops.c  | vnode operations                                 |
-| sys/fs/gefs/gefs_io.c     | device I/O and the write-back queue              |
-| sys/fs/gefs/gefs_commit.c | the commit protocol and background work          |
-|                           | (from fs.c: sync, sweep, snapshot jobs)          |
-| sys/modules/gefs          | the kernel module                                |
-| sbin/newfs_gefs           | ream (mkfs)                                      |
-| sbin/fsck_gefs            | check                                            |
-| sbin/mount_gefs           | mount helper (snapshot label, options)           |
-| usr.sbin/gefs             | snapshots, retention, sync, df (ioctl)           |
-| tests/                    | userland core tests and VM scripts               |
+(as built; the plan had more files)
+
+| path                       | what                                            |
+|----------------------------+-------------------------------------------------|
+| sys/fs/gefs/*.c            | the core, from 9front (fs.c, main.c, cons.c,    |
+|                            | ctl.c, fuzz.c are kept for reference, unbuilt)  |
+| sys/fs/gefs/compat/        | Plan 9 headers: types, locks, atomics, errors   |
+| sys/fs/gefs/p9fmt.c        | print(2) and fmtinstall(2)                      |
+| sys/fs/gefs/p9err.c        | waserror/error, allocation helpers, globals     |
+| sys/fs/gefs/p9kern.c       | kernel side: per-LWP state, locks, device I/O   |
+| sys/fs/gefs/p9user.c       | userland side (pthreads, files)                 |
+| sys/fs/gefs/ops.c, ops.h   | POSIX operations on the core (from fs.c)        |
+| sys/fs/gefs/sync.c         | commits, mounts of labels, snapshots, sweeping  |
+| sys/fs/gefs/snapadm.c      | adm/ctl commands, status, snapshot schedules    |
+| sys/fs/gefs/gefs_vfsops.c  | devices, mounts, sync, admin ioctl, mountroot   |
+| sys/fs/gefs/gefs_vnops.c   | vnode operations                                |
+| sys/fs/gefs/gefs_work.c    | mutator and reader threads, page I/O queue      |
+| sys/fs/gefs/files.gefs     | for a kernel with gefs built in                 |
+| sys/modules/gefs           | the kernel module                               |
+| sys/lib/libsa/gefs.[ch]    | read-only gefs for the boot loaders             |
+| sbin/mount_gefs            | mount helper and mount_gefs(8)                  |
+| usr.sbin/gefs              | gefs(8): newfs_gefs, fsck_gefs, administration  |
+| patches/                   | changes to NetBSD's own files (efiboot)         |
+| tests/gefstest.c           | userland tests of the core and the ops layer    |
+| tests/sagefs/              | the libsa reader in userland                    |
 
 * Compatibility layer
 
@@ -139,10 +150,10 @@ A commit is 9front's =sync()=, unchanged in its ordering, except:
   are pushed into it (=VOP_PUTPAGES=), so data and metadata go out in one
   burst.
 - Automatic snapshots (9front's "retain" schedule) are taken inside a
-  commit, only when the tree changed since the last one; an idle file system
-  takes none.  Without a configured schedule, the NetBSD default is
-  =24@h 7@d= (hourly for a day, daily for a week) rather than 9front's
-  minutely one.
+  commit, only when the label changed since that tier's last snapshot; an
+  idle file system takes none, and the snapshots kept are states that
+  differ.  9front's default (=60@m 24@h @d=, dailies kept forever) applies
+  to volumes that set none; =newfs_gefs= sets =60@m 24@h 14@d=.
 - =fsync= is a full commit, since gefs has no intent log.
 
 * File data and UBC
@@ -192,21 +203,42 @@ mode as mount options.
 
 * Snapshots and administration
 
-- =mount -t gefs -o snap=LABEL= mounts a label (default =main=); mutable
-  labels are written, immutable ones mount read-only.
-- =gefs(8)= talks to a mounted file system through ioctls on its root:
-  snapshot, delete, list, retain schedule, sync, df, check.
-- One device can back one mount at a time for now; exposing other snapshots
-  under the mount (9front's dump directory) comes later.
+- =mount -t gefs -o snap=LABEL= mounts a label (default =main=); forks are
+  written, snapshots mount read-only.  The labels of one device may be
+  mounted at once: the first mount opens the device and loads the file
+  system into a =gefsdev= (the core's Gefs, its mutator and readers), the
+  others share it, as 9front serves every label from one server (DragonFly's
+  HAMMER2 shares its device the same way).  A label is mounted once, since
+  two NetBSD mounts of one tree would cache its pages twice; each mount gets
+  its own fsid, since a fork shares its base's qids.
+- =gefs(8)= talks to a mounted file system through two ioctls on any of its
+  files: =GEFSIOC_CTL= runs one of 9front's adm/ctl commands (snap, fork,
+  delsnap, retain, sync, check, usereserve), =GEFSIOC_STATUS= returns
+  9front's adm/status text.  The same commands work on an unmounted device,
+  with the core linked into the tool.  Changing labels is authorized as
+  updating the mount (KAUTH_REQ_SYSTEM_MOUNT_UPDATE: root, or the owner of a
+  user mount; not at securelevel 2).  A snapshot of a mounted label first
+  puts the label's dirty pages into its tree.
+- 9front's =dump= view (every snapshot as a directory) is not provided;
+  snapshots are mounted by label.
 
 * Root file system and booting
 
-- Phase A: GEFS built into the kernel with =VFS_MOUNTROOT=; the kernel and
-  =boot.cfg= stay on the EFI system partition or a small FFS partition, and
-  the root is gefs (=root on dkN type gefs= or =rootfstype=).
-- Phase B: a read-only gefs reader in libsa (superblock, snapshot tree, label,
-  tree walk with pending messages applied, data blocks), so efiboot can load
-  the kernel from gefs directly.
+- A kernel with gefs built in (=files.gefs=, =file-system GEFS=) mounts its
+  root through =VFS_MOUNTROOT=, with root and type found as usual ("?": the
+  boot loader's boot wedge, each file system tried in turn).
+- =sys/lib/libsa/gefs.c= is a read-only gefs for the boot loaders: the
+  superblock, the label in the snapshot tree, the lookup with the pivots'
+  pending messages applied (inserts, deletes, clears, wstats, link
+  records), symbolic links, holes, =ls=; each block checked against its
+  pointer's hash.  About 1000 lines; at most GMAXHT+2 blocks cached per open
+  file (efiboot's heap is 1 MiB).  A path =@label/...= reads another label:
+  =boot @main@day.2026.09.27_00:00:00/netbsd= boots yesterday's kernel.
+- efiboot lists it with its other file systems (=patches/netbsd-11-efiboot.diff=)
+  and boots the GPT partition marked =bootme=.  The BIOS boot blocks
+  (bootxx) cannot read gefs; UEFI only.
+- GPT type for gefs partitions (proposed, not registered):
+  =38417555-670b-4a70-8e7a-bd7ce366f5a1=.
 
 * Testing
 
@@ -217,7 +249,7 @@ mode as mount options.
   checks: zero disk writes over minutes on an idle mount, and write bursts no
   more often than the commit schedule while something writes steadily.
 
-* Status (2026-09-27, evening)
+* Status (2026-09-28)
 
 Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
 
@@ -240,6 +272,35 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
   every 2 s caused writes in 2 of 7 ten-second windows (the syncer's 30 s
   commits), not 35.  Unmount logs the counters, e.g. for the copy of the whole
   userland: 5 commits, 144086 block writes, 11 cache flushes.
+- *Snapshots*: snap, fork, delsnap, retain and status through the ioctl and
+  offline; a snapshot and a fork mounted next to main (each with its own
+  fsid), a snapshot read-only and keeping the old data, a mounted label not
+  deletable, a fork's space back when it is deleted.  With a line appended
+  every 10 s for 2.5 min, one minute snapshot was taken per minute and none
+  in the idle minutes after; the idle windows had no I/O.
+- *Booting from gefs (UEFI)*: a disk with only an ESP (efiboot with the
+  libsa reader) and a gefs partition (bootme) boots a NetBSD 11 GENERIC+gefs
+  kernel under OVMF: efiboot reads boot.cfg, the entropy file and the 29 MB
+  kernel from gefs, the kernel finds its root from the boot wedge and runs
+  multi-user from gefs; writes survive reboots; =ls= at the boot prompt;
+  =boot @before-reboot/netbsd= loads the kernel from a snapshot.  The reader
+  in userland read 939 files of the root identically to the kernel.
+- *Low memory*: filling the file system with dd deadlocked the VM (no free
+  pages: the pagedaemon gave the mutator dirty pages to write, the mutator
+  waited for memory).  Now writes are pushed into the tree behind the writer
+  (1 MiB windows, as FFS does), at most 64 page writes are queued (writers
+  wait), and the pagedaemon never waits in gefs: when the queue is full it
+  gets ENOMEM and UVM redirties the page.  The fill completes with the VM
+  responsive.
+- *A full file system*: rm, commits and unmount use the arenas' reserve
+  (9front needed "usereserve 1"), down to a floor kept for the allocation
+  log; an arena at its limit sends allocations to the next one; big
+  deletions commit on the way when half the reserve is gone; log
+  compression waits while an arena is in its reserve.  write(2) returns
+  ENOSPC 64 MiB before the end, after committing to get freed space back;
+  a page write that fails anyway is reported by the next write, fsync or
+  close.  A 4 GB volume fills (dd gets ENOSPC), empties with rm, takes 2 GB
+  again at once, unmounts and checks clean.
 
 ** What the implementation taught
 
@@ -261,6 +322,19 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
   now dropped before the data is freed.
 - *Commit before letting go of a label.*  sync() only snapshots mounted
   labels; changes made just before clunkmount were lost.
+- *The page-out path must not wait on the file system.*  All writes of a
+  gefs file go through its mutator thread, so the pagedaemon, the only way
+  to get memory back, ended up waiting behind a mutator that waited for
+  memory.  Write-behind keeps dirty pages few; the pagedaemon's writes fail
+  fast (ENOMEM, redirtied) instead of waiting.
+- *Deletes are lazy in a Bε-tree*: a removed file's blocks free when its
+  clear messages reach the leaves, and blocks from before the last commit
+  free after the next one.  A full file system needs room to delete in; the
+  reserve provides it once the allocator may use it for that and moves on
+  from an exhausted arena instead of calling it corruption.
+- *KAUTH_SYSTEM_FS_SNAPSHOT is FFS's*: its listener takes the vnode argument
+  for an FFS inode, and paniced on a gefs one.  Label changes are authorized
+  as mount updates.
 - *A 9front bug*: wstat truncation to a length that is not a multiple of the
   block size queued Oclearb messages at unaligned keys, which match nothing:
   the blocks after the new end stayed (a leak, and old data reappeared when
@@ -282,10 +356,13 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
 
 ** Next
 
-- Snapshot administration: an ioctl on the root and =gefs snap/rm/ls=.
-- A read-only reader in libsa so efiboot loads the kernel from gefs (today
-  the kernel is read from the ESP or an FFS partition; root is gefs).
-- Frees after deleting much: they wait for lazy follow-up commits (up to
-  Lazymax); commit sooner when a lot is pending.
-- ctime, extended attributes, NFS export (needs a qid index), ACLs.
-- Measure on the laptop: power over hours, NVMe idle states.
+- On the laptop: build the module (or =file-system GEFS=) against its
+  kernel tree, measure power over hours and the NVMe idle states, then
+  decide about a gefs root there.
+- Space reservations for dirty pages (today: a 64 MiB margin; many small
+  files written within one syncer interval could still overcommit).
+- A root booted from a snapshot (a boot environment): pass the label from
+  the loader to the kernel.
+- 9front's dump view; ctime, extended attributes, NFS export (needs a qid
+  index), ACLs.
+- Report the wstat truncation bug to Ori.
