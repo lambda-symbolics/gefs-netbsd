@@ -159,8 +159,19 @@ cachepluck(void)
 	Blk *b;
 
 	qlock(&fs->lrulk);
-	while(fs->ctail == nil)
+	while(fs->ctail == nil){
+		/*
+		 * NetBSD: queued blocks are only written when the queue
+		 * is drained; writing them is what frees cache blocks.
+		 */
+		if(qlen() > 0){
+			qunlock(&fs->lrulk);
+			qdrainall();
+			qlock(&fs->lrulk);
+			continue;
+		}
 		rsleep(&fs->lrurz);
+	}
 
 	b = fs->ctail;
 	bassert(b, b->magic == Magic);

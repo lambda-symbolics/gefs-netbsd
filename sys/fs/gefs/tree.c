@@ -401,6 +401,11 @@ statupdate(Kvp *kv, Msg *m)
 	if(p != m->v + m->nv)
 		fatal("malformed stat: kv=%P, m=%M\n", kv, m);
 	e = packdval(kv->v, kv->nv, &d);
+	/* NetBSD: keep the devt/rdev tail of an entry from Ori's port */
+	if(e != nil && kv->nv == Xdirsz+8){
+		PACK32(e, d.devt);	e += 4;
+		PACK32(e, d.rdev);	e += 4;
+	}
 	if(e == nil || e - kv->v != kv->nv)
 		fatal("repacking dir failed\n");
 }

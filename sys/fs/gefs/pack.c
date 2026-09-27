@@ -115,7 +115,11 @@ kv2dir(Kvp *kv, Xdir *d)
 	char *v;
 
 	memset(d, 0, sizeof(Xdir));
-	if(kv->nk < 9 || kv->nv != Xdirsz)
+	/*
+	 * NetBSD: entries are always Xdirsz here, as on 9front; Ori's
+	 * OpenBSD port appends devt[4] rdev[4] to device nodes, read too.
+	 */
+	if(kv->nk < 9 || (kv->nv != Xdirsz && kv->nv != Xdirsz+8))
 		broke(Efs);
 
 	unpackstr(kv->k + 9, kv->k + kv->nk, &d->name);
@@ -132,7 +136,11 @@ kv2dir(Kvp *kv, Xdir *d)
 	d->uid		= UNPACK32(v);	v += 4;
 	d->gid		= UNPACK32(v);	v += 4;
 	d->muid		= UNPACK32(v);	v += 4;
-	assert(v - kv->v == Xdirsz);
+	if(kv->nv == Xdirsz+8){
+		d->devt	= UNPACK32(v);	v += 4;
+		d->rdev	= UNPACK32(v);	v += 4;
+	}
+	assert(v - kv->v == kv->nv);
 }
 
 int

@@ -857,24 +857,42 @@ freebp(Tree *t, Bptr bp)
 	limbo(DFbp, f);
 }
 
+/*
+ * NetBSD: 9front keeps one epoch slot per worker proc.  Here any thread
+ * can enter, so each epoch counts the threads in it; a thread keeps its
+ * epoch in its error context, and may nest.
+ */
 void
 epochstart(int tid)
 {
+	Errctx *c;
 	ulong ge;
 
-	assert(tid >= 0);
-	ge = agetl(&fs->epoch);
-	aswapl(&fs->lepoch[tid], ge | Eactive);
+	USED(tid);
+	c = *errctx;
+	if(c->nepoch++ > 0)
+		return;
+	while(1){
+		ge = agetl(&fs->epoch);
+		aincl(&fs->ecount[ge], 1);
+		if(agetl(&fs->epoch) == ge)
+			break;
+		aincl(&fs->ecount[ge], -1);
+	}
+	c->epoch = ge;
 }
 
 void
 epochend(int tid)
 {
-	ulong le;
+	Errctx *c;
 
-	assert(tid >= 0);
-	le = agetl(&fs->lepoch[tid]);
-	aswapl(&fs->lepoch[tid], le &~ Eactive);
+	USED(tid);
+	c = *errctx;
+	assert(c->nepoch > 0);
+	if(--c->nepoch > 0)
+		return;
+	aincl(&fs->ecount[c->epoch], -1);
 }
 
 /* clears limbo lists; returns if the epoch advanced */
@@ -890,24 +908,25 @@ epochclean(void)
 	Arena *a;
 	Qent qe;
 
+	/* NetBSD: a thread still in an old epoch would wait for itself */
+	assert((*errctx)->nepoch == 0);
 	if(!canlock(&fs->epochlk))
 		return 0;
 	delay = 0;
 Again:
 	c = agetl(&fs->nlimbo);
 	ge = agetl(&fs->epoch);
-	for(i = 0; i < agetl(&fs->nworker); i++){
-		e = agetl(&fs->lepoch[i]);
-		if((e & Eactive) && e != (ge | Eactive)){
-			if(c < fs->cmax/4){
-				unlock(&fs->epochlk);
-				return 0;
-			}
-			if(delay == 300)
-				fprint(2, "stalled epoch %lx [worker %d]\n", e, i);
-			sleep(delay++);
-			goto Again;
+	/* NetBSD: everyone still inside must be in the current epoch */
+	e = agetl(&fs->ecount[(ge+1)%3]) + agetl(&fs->ecount[(ge+2)%3]);
+	if(e != 0){
+		if(c < fs->cmax/4){
+			unlock(&fs->epochlk);
+			return 0;
 		}
+		if(delay == 300)
+			fprint(2, "stalled epoch %lx\n", ge);
+		sleep(delay++);
+		goto Again;
 	}
 	p = aswapp(&fs->limbo[(ge+1)%3], nil);
 	aswapl(&fs->epoch, (ge+1)%3);
@@ -1026,8 +1045,15 @@ qput(Syncq *q, Qent qe)
 		bassert(qe.b, agetl(&qe.b->ref) > 0);
 	qlock(&q->lk);
 	qe.qgen = agetv(&fs->qgen);
-	while(q->nheap == q->heapsz)
-		rsleep(&q->fullrz);
+	/*
+	 * NetBSD: nothing drains the queue in the background, so a full
+	 * queue is drained here, outside the lock.
+	 */
+	while(q->nheap == q->heapsz){
+		qunlock(&q->lk);
+		qdrain(q, agetv(&fs->qgen));
+		qlock(&q->lk);
+	}
 	for(i = q->nheap; i > 0; i = (i-1)/2){
 		if(qcmp(&qe, &q->heap[(i-1)/2]) == 1)
 			break;
@@ -1079,51 +1105,119 @@ Out:
 	return e;
 }
 
-void
-runsync(int, void *p)
+/*
+ * NetBSD: pop the first entry if it belongs to generation upto or an
+ * earlier one, without sleeping.
+ */
+static int
+qtrypop(Syncq *q, vlong upto, Qent *e)
+{
+	int i, l, r, m;
+	Qent t;
+
+	qlock(&q->lk);
+	if(q->nheap == 0 || q->heap[0].qgen > upto){
+		qunlock(&q->lk);
+		return 0;
+	}
+	*e = q->heap[0];
+	if(--q->nheap == 0)
+		goto Out;
+
+	i = 0;
+	q->heap[0] = q->heap[q->nheap];
+	while(1){
+		m = i;
+		l = 2*i+1;
+		r = 2*i+2;
+		if(l < q->nheap && qcmp(&q->heap[m], &q->heap[l]) == 1)
+			m = l;
+		if(r < q->nheap && qcmp(&q->heap[m], &q->heap[r]) == 1)
+			m = r;
+		if(m == i)
+			break;
+		t = q->heap[m];
+		q->heap[m] = q->heap[i];
+		q->heap[i] = t;
+		i = m;
+	}
+Out:
+	rwakeup(&q->fullrz);
+	qunlock(&q->lk);
+	if(e->b != nil){
+		setflag(e->b, 0, Bqueued);
+		e->b->queued = 0;
+	}
+	return 1;
+}
+
+static void
+qexec(Qent qe)
 {
 	Arena *a;
-	Syncq *q;
+
+	switch(qe.op){
+	case Qfree:
+		tracex("qfreeb", qe.bp, qe.qgen, -1);
+		/*
+		 * we shouldn't have a block in a free op,
+		 * the frees go into the queue just to ensure
+		 * write/reuse ordering.
+		 */
+		assert(qe.b == nil);
+		a = getarena(qe.bp.addr);
+		qlock(a);
+		blkdealloc_lk(a, qe.bp.addr);
+		qunlock(a);
+		break;
+	case Qfence:
+		tracev("qfence", qe.qgen);
+		break;
+	case Qwrite:
+		tracex("qsyncb", qe.bp, qe.qgen, -1);
+		if(checkflag(qe.b, Bfreed, Bstatic) == 0)
+			syncblk(qe.b);
+		dropblk(qe.b);
+		break;
+	default:
+		abort();
+	}
+}
+
+/*
+ * NetBSD: blocks queued with enqueue() stay in memory until something
+ * drains the queue: a commit, fsync, a full queue, or a cache that has
+ * run out of blocks to reuse.  A block freed while queued is never
+ * written.  Must not be called with an arena locked.
+ */
+void
+qdrain(Syncq *q, vlong upto)
+{
 	Qent qe;
 
-	q = p;
-	if(waserror()){
-		aincl(&fs->rdonly, 1);
-		fprint(2, "error syncing: %s\n", errmsg());
-		return;
-	}
-	while(1){
-		qe = qpop(q);
-		switch(qe.op){
-		case Qfree:
-			tracex("qfreeb", qe.bp, qe.qgen, -1);
-			/*
-			 * we shouldn't have a block in a free op,
-			 * the frees go into the queue just to ensure
-			 * write/reuse ordering.
-			 */
-			assert(qe.b == nil);
-			a = getarena(qe.bp.addr);
-			qlock(a);
-			blkdealloc_lk(a, qe.bp.addr);
-			qunlock(a);
-			break;
-		case Qfence:
-			tracev("qfence", qe.qgen);
-			qlock(&fs->synclk);
-			if(--fs->syncing == 0)
-				rwakeupall(&fs->syncrz);
-			qunlock(&fs->synclk);
-			break;
-		case Qwrite:
-			tracex("qsyncb", qe.bp, qe.qgen, -1);
-			if(checkflag(qe.b, Bfreed, Bstatic) == 0)
-				syncblk(qe.b);
-			dropblk(qe.b);
-			break;
-		default:
-			abort();
-		}
-		assert(estacksz() == 1);
-	}
+	while(qtrypop(q, upto, &qe))
+		qexec(qe);
+}
+
+void
+qdrainall(void)
+{
+	vlong g;
+	int i;
+
+	g = agetv(&fs->qgen);
+	for(i = 0; i < fs->nsyncers; i++)
+		qdrain(&fs->syncq[i], g);
+}
+
+long
+qlen(void)
+{
+	long n;
+	int i;
+
+	n = 0;
+	for(i = 0; i < fs->nsyncers; i++)
+		n += fs->syncq[i].nheap;
+	return n;
 }

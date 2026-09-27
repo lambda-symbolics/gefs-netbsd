@@ -416,6 +416,9 @@ struct Errctx {
 	char	err[128];
 	jmp_buf	errlab[Estacksz];
 	int	nerrlab;
+	/* NetBSD: the epoch this thread is in, and how deeply */
+	ulong	epoch;
+	int	nepoch;
 };
 
 struct Arange {
@@ -566,6 +569,11 @@ struct Gefs {
 
 	QLock	synclk;
 	Rendez	syncrz;
+	QLock	cmtlk;		/* NetBSD: one commit at a time */
+	Along	lazydirty;	/* NetBSD: only lazy updates (atime) pending */
+	vlong	ncommit;	/* NetBSD: commits written */
+	vlong	nskip;		/* NetBSD: commits skipped, nothing dirty */
+	vlong	lastcommit;	/* NetBSD: nsec() of the last commit */
 
 	QLock	mountlk;
 	Aptr	mounts;	/* Mount* */
@@ -583,6 +591,7 @@ struct Gefs {
 
 	Along	epoch;
 	Along	lepoch[32];
+	Along	ecount[3];	/* NetBSD: threads in each epoch */
 	Aptr	limbo[3]; /* Limbo* */
 	Along	nlimbo;
 	Lock	epochlk;
@@ -662,6 +671,9 @@ struct Xdir {
 	int	gid;	/* group name */
 	int	muid;	/* last modifier name */
 	char	*name;	/* last element of path */
+	/* NetBSD: device nodes (GEFS_FDEVNOD), not part of the entry */
+	int	devt;
+	uvlong	rdev;
 };
 
 struct Dent {
@@ -679,6 +691,11 @@ struct Dent {
 		char	buf[Maxent];
 		void	*auth;
 	};
+	/* NetBSD */
+	int	nlink;		/* names: 1, or Khref's count */
+	int	orphan;		/* removed; data goes at the last release */
+	char	oname[17];	/* its name in the orphanage */
+	void	*vdata;		/* the vnode layer's node */
 };
 
 struct Cron {

@@ -55,6 +55,9 @@ Blk*	cachepluck(void);
 
 void	qinit(Syncq*);
 void	qput(Syncq*, Qent);
+void	qdrain(Syncq*, vlong);
+void	qdrainall(void);
+long	qlen(void);
 
 Arena*	getarena(vlong);
 void	syncblk(Blk*);

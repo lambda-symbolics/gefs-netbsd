@@ -21,6 +21,25 @@
 #include "dat.h"
 #include "fns.h"
 
+#undef pwrite
+#undef pread
+
+long long	p9nwrite, p9nread;
+
+ssize_t
+p9pwrite(int fd, const void *b, size_t n, off_t o)
+{
+	__atomic_add_fetch(&p9nwrite, 1, __ATOMIC_SEQ_CST);
+	return pwrite(fd, b, n, o);
+}
+
+ssize_t
+p9pread(int fd, void *b, size_t n, off_t o)
+{
+	__atomic_add_fetch(&p9nread, 1, __ATOMIC_SEQ_CST);
+	return pread(fd, b, n, o);
+}
+
 static Gefs	*curfs;
 static __thread Errctx	*curerr;
 static __thread char	errstrbuf[ERRMAX];

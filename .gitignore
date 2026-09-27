@@ -1,2 +1,3 @@
 usr.sbin/gefs/gefs
 *.o
+usr.sbin/gefs/gefstest

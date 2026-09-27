@@ -18,6 +18,7 @@
 #include <sys/mutex.h>
 #include <sys/rwlock.h>
 #include <sys/condvar.h>
+#include <sys/errno.h>
 #include <lib/libkern/libkern.h>
 typedef label_t jmp_buf[1];
 #define setjmp(j)	setjmp(j)
@@ -36,6 +37,12 @@ typedef label_t jmp_buf[1];
 #undef longjmp
 #define setjmp(j)	_setjmp(j)
 #define longjmp(j, v)	_longjmp(j, v)
+/* counted, so tests can check that an idle file system writes nothing */
+extern long long	p9nwrite, p9nread;
+ssize_t	p9pwrite(int, const void*, size_t, off_t);
+ssize_t	p9pread(int, void*, size_t, off_t);
+#define pwrite(f, b, n, o)	p9pwrite(f, b, n, o)
+#define pread(f, b, n, o)	p9pread(f, b, n, o)
 #endif
 
 /* open modes (the same values as POSIX) */
