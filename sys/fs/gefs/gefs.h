@@ -144,6 +144,7 @@ void	gefs_post(struct gefsmount *, void (*)(struct gefsmount *, void *), void *)
 void	gefs_queuebuf(struct gefsmount *, struct vnode *, struct buf *);
 
 /* gefs_vfsops.c */
+extern int	gefs_trace;
 int	gefs_vnget(struct mount *, struct Dent *, struct vnode **);
 int	gefs_commit(struct gefsmount *, int, int);
 int	gefs_putall(struct mount *, int);

@@ -29,6 +29,8 @@
 #include <miscfs/specfs/specdev.h>
 #include <miscfs/fifofs/fifo.h>
 #include <uvm/uvm_extern.h>
+#include <uvm/uvm_page.h>
+#include <uvm/uvm_page_array.h>
 
 #include <u.h>
 #include <libc.h>
@@ -155,8 +157,13 @@ static void
 gefs_sajob(struct gefsmount *gm, void *v)
 {
 	struct saargs *a = v;
+	vlong olen = a->de->length;
 
 	gefssetattr(gm->gm_mnt, a->de, a->a, a->mask, a->uid);
+	if(gefs_trace && (a->mask & Asize))
+		printf("gefs: truncated qid %llx in the tree: length %lld -> %lld\n",
+		    (unsigned long long)a->de->qid.path, (long long)olen,
+		    (long long)a->de->length);
 }
 
 struct lnargs {
@@ -538,6 +545,51 @@ gefs_getattr(void *v)
 	return 0;
 }
 
+/* is a page of vp cached at or after off? */
+static bool
+gefs_pagespast(struct vnode *vp, voff_t off)
+{
+	struct uvm_object *uobj = &vp->v_uobj;
+	struct uvm_page_array a;
+	struct vm_page *pg;
+
+	rw_enter(uobj->vmobjlock, RW_READER);
+	uvm_page_array_init(&a, uobj, 0);
+	pg = uvm_page_array_fill_and_peek(&a, off, 0);
+	uvm_page_array_fini(&a);
+	rw_exit(uobj->vmobjlock);
+	return pg != NULL;
+}
+
+/*
+ * After uvm_vnp_setsize shrank vp: no page past the end may stay.  A
+ * synchronous putpages skips busy pages ("other's activities"), and ours
+ * stay busy while their I/O waits for the mutator or a reader; such a
+ * page, filled or written before the truncation, would bring old data
+ * back when the file grows.  Wait for the I/O, and drop them again.
+ */
+static void
+gefs_droppast(struct vnode *vp, voff_t size)
+{
+	voff_t off = round_page(size);
+	int tries;
+
+	for(tries = 0; gefs_pagespast(vp, off); tries++){
+		mutex_enter(vp->v_interlock);
+		while(vp->v_numoutput > 0)
+			cv_wait(&vp->v_cv, vp->v_interlock);
+		mutex_exit(vp->v_interlock);
+		if(tries > 0)
+			kpause("gefstrnc", false, 1, NULL);	/* a read in flight */
+		rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
+		(void)VOP_PUTPAGES(vp, off, 0, PGO_FREE | PGO_SYNCIO);
+		if(tries == 1000){
+			printf("gefs: pages past the end of a truncated file stay\n");
+			break;
+		}
+	}
+}
+
 static int
 gefs_setattr(void *v)
 {
@@ -548,7 +600,7 @@ gefs_setattr(void *v)
 	struct gefsmount *gm = GMP(vp);
 	Dent *de = VTODE(vp);
 	Gattr a, n;
-	int mask, error, uid;
+	int mask, error, uid, locked;
 
 	if(vap->va_type != VNON || vap->va_nlink != VNOVAL ||
 	    vap->va_fsid != VNOVAL || vap->va_fileid != VNOVAL ||
@@ -556,6 +608,7 @@ gefs_setattr(void *v)
 	    vap->va_bytes != VNOVAL || vap->va_gen != VNOVAL)
 		return EINVAL;
 	gefsgetattr(de, &a);
+	locked = 0;
 	memset(&n, 0, sizeof(n));
 	mask = 0;
 	uid = kauth_cred_geteuid(cred);
@@ -645,17 +698,36 @@ gefs_setattr(void *v)
 				ubc_zerorange(&vp->v_uobj, vap->va_size, rem,
 				    UBC_VNODE_FLAGS(vp));
 		}
+		if(gefs_trace)
+			printf("gefs: truncate qid %llx %lld -> %lld\n",
+			    (unsigned long long)de->qid.path,
+			    (long long)vp->v_size, (long long)vap->va_size);
+		/*
+		 * As FFS: no getpages from here until the tree is cut too.
+		 * Read-ahead could otherwise bring in pages past the new end
+		 * (between uvm_vnp_setsize dropping them and setting v_size),
+		 * filled from the tree before it was truncated, and the old
+		 * data would show once the file grew again.
+		 */
+		genfs_node_wrlock(vp);
 		uvm_vnp_setsize(vp, vap->va_size);
+		gefs_droppast(vp, vap->va_size);
 		n.size = vap->va_size;
 		mask |= Asize;
+		locked = 1;
 	}
 attrs:
-	if(mask == 0)
+	if(mask == 0){
+		if(locked)
+			genfs_node_unlock(vp);
 		return 0;
+	}
 	{
 		struct saargs sa = { .de = de, .a = &n, .mask = mask, .uid = uid };
 		error = gefs_call(gm, gefs_sajob, &sa);
 	}
+	if(locked)
+		genfs_node_unlock(vp);
 	return error;
 }
 
@@ -754,6 +826,11 @@ gefs_write(void *v)
 		 */
 		if(error == 0 && oldoff / GEFS_WBEHIND !=
 		    uio->uio_offset / GEFS_WBEHIND){
+			if(gefs_trace)
+				printf("gefs: write-behind qid %llx %lld..%lld\n",
+				    (unsigned long long)de->qid.path,
+				    (long long)rounddown(oldoff, GEFS_WBEHIND),
+				    (long long)rounddown(uio->uio_offset, GEFS_WBEHIND));
 			rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
 			error = VOP_PUTPAGES(vp,
 			    rounddown(oldoff, GEFS_WBEHIND),

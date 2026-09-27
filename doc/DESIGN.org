@@ -332,6 +332,15 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
   free after the next one.  A full file system needs room to delete in; the
   reserve provides it once the allocator may use it for that and moves on
   from an exhausted arena instead of calling it corruption.
+- *genfs skips busy pages in a synchronous putpages* ("other's
+  activities"), and so does the uvn_put in uvm_vnp_setsize.  gefs's page
+  I/O stays busy while it waits for the mutator or a reader, so a truncation
+  left such pages past the new end, with data from before it, and they
+  showed when the file grew again.  Found with tests/fsxlite.c (random
+  writes, truncations, mmap, fsync, remounts against a copy in memory,
+  after fsx).  Truncation now holds the genfs node lock as FFS does, and
+  drops what is left past the end once its I/O is done.  240,000 random
+  operations, with and without mmap and remounts, compare equal.
 - *KAUTH_SYSTEM_FS_SNAPSHOT is FFS's*: its listener takes the vnode argument
   for an FFS inode, and paniced on a gefs one.  Label changes are authorized
   as mount updates.

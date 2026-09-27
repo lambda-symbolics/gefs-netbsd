@@ -34,6 +34,28 @@
 MODULE(MODULE_CLASS_VFS, gefs, NULL);
 
 static int	gefs_cachemb = 64;	/* default block cache, MiB */
+int		gefs_trace;		/* vfs.gefs.trace: log page I/O and truncation */
+static struct sysctllog *gefs_sysctl_log;
+
+static void
+gefs_sysctl_init(void)
+{
+	const struct sysctlnode *node;
+
+	sysctl_createv(&gefs_sysctl_log, 0, NULL, &node, CTLFLAG_PERMANENT,
+	    CTLTYPE_NODE, "gefs", SYSCTL_DESCR("gefs"), NULL, 0, NULL, 0,
+	    CTL_VFS, CTL_CREATE, CTL_EOL);
+	if(node == NULL)
+		return;
+	sysctl_createv(&gefs_sysctl_log, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "trace",
+	    SYSCTL_DESCR("log page I/O and truncations"), NULL, 0,
+	    &gefs_trace, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(&gefs_sysctl_log, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "cachemb",
+	    SYSCTL_DESCR("block cache of a new mount, MiB"), NULL, 0,
+	    &gefs_cachemb, 0, CTL_CREATE, CTL_EOL);
+}
 
 /* 9front's user table is kept on disk but not used: ids are numeric */
 void
@@ -908,6 +930,7 @@ static void
 gefs_init(void)
 {
 	rw_init(&gefs_mntlock);
+	gefs_sysctl_init();
 #ifndef _MODULE
 	/* built in: no module command to set up the compatibility layer */
 	if(p9kinit() != 0)
@@ -918,6 +941,7 @@ gefs_init(void)
 static void
 gefs_done(void)
 {
+	sysctl_teardown(&gefs_sysctl_log);
 	rw_destroy(&gefs_mntlock);
 }
 

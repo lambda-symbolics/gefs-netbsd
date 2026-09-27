@@ -54,6 +54,12 @@ gefs_bufio(struct gefsmount *gm, struct vnode *vp, struct buf *bp)
 
 	off = (off_t)bp->b_blkno << DEV_BSHIFT;
 	len = bp->b_bcount;
+	if(gefs_trace)
+		printf("gefs: %s qid %llx %lld+%ld v_size %lld length %lld%s\n",
+		    (bp->b_flags & B_READ) ? "read" : "write",
+		    (unsigned long long)de->qid.path, (long long)off, len,
+		    (long long)vp->v_size, (long long)de->length,
+		    (de->gone || de->orphan) ? " (removed)" : "");
 	if(bp->b_flags & B_READ){
 		n = gefsread(gm->gm_mnt, de, bp->b_data, off, len);
 		if(n < len)

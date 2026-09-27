@@ -589,6 +589,37 @@ phase7(void)
 	qunlock(&fs->mutlk);
 }
 
+/* phase 8: fsxlite's seed 1 on the kernel, as the page-outs did it */
+static void
+phase8(void)
+{
+	Dent *f;
+	char *a, *z;
+	vlong x;
+
+	mount();
+	a = malloc(64*1024);
+	z = calloc(1, 64*1024);
+	memset(a, 0x3c, 64*1024);
+	f = mk(root, "seed1", Greg, 0644);
+	gefstrunc(mnt, f, 2711547, 0);
+	gefswrite(mnt, f, a, 3100672, 9318, 3109990, 0);	/* op 7214, then fsync */
+	commit(0);
+	gefstrunc(mnt, f, 1383523, 0);				/* 7227 */
+	gefswrite(mnt, f, z, 1380352, 3171, 4067041, 0);	/* the zeroed last page */
+	gefswrite(mnt, f, a, 4063232, 3809, 4067041, 0);	/* 7228, then fsync */
+	commit(0);
+	gefstrunc(mnt, f, 3230429, 0);				/* 7239 */
+	gefswrite(mnt, f, a, 3203072, 61709, 3264781, 0);	/* 7241 */
+	gefstrunc(mnt, f, 3545901, 0);				/* 7247 */
+	x = 3104660;
+	CHECK(iszero(f, 3096576, 16384), "old data came back at %lld", x);
+	clunkdent(mnt, f);
+	free(a);
+	free(z);
+	unmount();
+}
+
 static void
 run(char *name, void (*fn)(void))
 {
@@ -635,6 +666,7 @@ main(int argc, char **argv)
 	run("snapshots", phase5);
 	run("snapshots after a reload", phase6);
 	run("a full file system", phase7);
+	run("truncate, grow and old data", phase8);
 	fprint(2, failures ? "FAILED\n" : "all passed\n");
 	return failures != 0;
 }
