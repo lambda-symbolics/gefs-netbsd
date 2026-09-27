@@ -79,6 +79,7 @@ void	finalize(Blk*);
 
 Mount*	getmount(char*);
 void	clunkmount(Mount*);
+void	freemount(Mount*);	/* NetBSD: snapadm.c */
 
 Tree*	updatesnap(Tree*, char*, int);
 void	tagsnap(Tree*, char*, int);

@@ -183,6 +183,8 @@ fssync(void)
 	return ok;
 }
 
+static void	sweeps(void);
+
 /*
  * Commit if anything changed since the last commit (or, with Clazy, if
  * lazy updates such as atime are pending).  Returns whether it wrote.
@@ -219,6 +221,8 @@ commit(int flags)
 		qunlock(&fs->cmtlk);
 		nexterror();
 	}
+	/* what 9front's tasks proc did every 5 s, with this commit */
+	autosnaps();
 	for(i = 0; i < fs->narena; i++){
 		a = &fs->arenas[i];
 		oldhd[i] = Zb;
@@ -263,11 +267,13 @@ commit(int flags)
 	}
 	/*
 	 * The deadlists this commit freed become durable with the next
-	 * one, a lazy one if nothing else happens.
+	 * one, a lazy one if nothing else happens; so do the blocks of
+	 * the trees whose deletion this commit made durable.
 	 */
 	fs->lastcommit = nsec();
 	if(!ok)
 		aswapl(&fs->lazydirty, 1);
+	sweeps();
 	poperror();
 	free(oldhd);
 	qunlock(&fs->cmtlk);
@@ -298,9 +304,10 @@ drainsyncq(void)
 			nexterror();
 		}
 		n = fssync();
+		sweeps();
 		poperror();
 		qunlock(&fs->cmtlk);
-		if(n)
+		if(n && fs->sweepq == nil)
 			break;
 	}
 }
@@ -348,8 +355,11 @@ getmount(char *name)
 	 */
 	if((t = opensnap(name, &flg)) == nil)
 		error(Enosnap);
+	mnt = nil;
 	if(waserror()){
 		closesnap(t);
+		if(mnt != nil)
+			freemount(mnt);
 		nexterror();
 	}
 	mnt = emalloc(sizeof(*mnt), 1);
@@ -357,13 +367,14 @@ getmount(char *name)
 	snprint(mnt->name, sizeof(mnt->name), "%s", name);
 	mnt->flag = flg;
 	aswapp(&mnt->root, t);
+	loadautos(mnt);	/* NetBSD: as 9front's getmount */
 	poperror();
 
 	qlock(&fs->mountlk);
 	if((p = mountlookup(name)) != nil){
 		qunlock(&fs->mountlk);
 		closesnap(t);
-		free(mnt);
+		freemount(mnt);
 		return p;
 	}
 	mnt->mnext = agetp(&fs->mounts);
@@ -412,6 +423,7 @@ upsert(Mount *mnt, Msg *m, int nm)
 		aswapp(&mnt->root, r);
 	}
 	btupsert(r, m, nm);
+	mnt->nchange++;
 	fs->snap.dirty = 1;
 }
 
@@ -503,11 +515,77 @@ sweeptree(Tree *t)
 }
 
 /*
+ * NetBSD: trees whose deletion the next commit makes durable, to sweep
+ * after it (9front's AOsnap synced, then swept); on the mutator.
+ */
+typedef struct Sweep Sweep;
+struct Sweep {
+	Tree	*t;
+	Sweep	*next;
+};
+
+void
+pushsweep(Tree *t)
+{
+	Sweep *s;
+
+	s = emalloc(sizeof(Sweep), 0);
+	s->t = t;
+	s->next = fs->sweepq;
+	fs->sweepq = s;
+}
+
+/*
+ * After a commit: sweep the queued trees, and delete their predecessors
+ * that nothing holds any more, to sweep after the next commit.  The
+ * frees reach the disk with the next commit, a lazy one at the latest.
+ */
+static void
+sweeps(void)
+{
+	Sweep *s, *next;
+	Tree *t, *n;
+	int ok;
+
+	s = fs->sweepq;
+	fs->sweepq = nil;
+	for(; s != nil; s = next){
+		next = s->next;
+		t = s->t;
+		free(s);
+		if(waserror()){
+			fprint(2, "gefs: sweeping a deleted snapshot: %s\n", errmsg());
+			continue;
+		}
+		n = sweeptree(t);	/* t leaked on error() */
+		closesnap(t);
+		ok = 0;
+		if(n != nil && n->nref == 0 && n->nlbl == 0){
+			qlock(&fs->mutlk);
+			if(waserror()){
+				qunlock(&fs->mutlk);
+				nexterror();
+			}
+			ok = delsnap(n, n->succ, nil);
+			qunlock(&fs->mutlk);
+			poperror();
+		}
+		if(ok){
+			pushsweep(n);
+			fs->snap.dirty = 1;
+		}else if(n != nil)
+			closesnap(n);
+		aswapl(&fs->lazydirty, 1);
+		poperror();
+	}
+}
+
+/*
  * Adds or removes a labelled snapshot; if the tree
  * needs to be cleaned up outside of the epoch, it
  * is returned, otherwise snapfs returns nil.
  */
-static Tree*
+Tree*
 snapfs(char *old, char *new, int flag, int delete)
 {
 	Tree *t, *s, *r;
@@ -527,7 +605,7 @@ snapfs(char *old, char *new, int flag, int delete)
 		break;
 	}
 	if(t == nil && (t = opensnap(old, nil)) == nil)
-		error(Eexist);
+		error(Enolabel);	/* NetBSD: was Eexist */
 	if(waserror()){
 		closesnap(t);
 		nexterror();

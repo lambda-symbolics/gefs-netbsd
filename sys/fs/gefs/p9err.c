@@ -57,6 +57,7 @@ broke(char *fmt, ...)
 	va_list ap;
 
 	aincl(&fs->rdonly, 1);
+	aincl(&fs->broken, 1);
 	va_start(ap, fmt);
 	errorv(fmt, ap, 1);
 }

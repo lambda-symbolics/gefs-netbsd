@@ -70,6 +70,34 @@ fmtstr(Fmt *f, const char *s)
 		fmtpad(f, w, ' ');
 }
 
+/* %q: rc-style quotes when needed (empty, blanks, controls, quotes) */
+static void
+fmtquote(Fmt *f, const char *s)
+{
+	int i, n, q;
+
+	if(s == nil)
+		s = "<nil>";
+	for(n = 0; s[n] != 0; n++)
+		if((f->flags & FmtPrec) && n >= f->prec)
+			break;
+	q = (n == 0);
+	for(i = 0; i < n; i++)
+		if((uchar)s[i] <= ' ' || s[i] == '\'')
+			q = 1;
+	if(!q){
+		fmtputs(f, s, n);
+		return;
+	}
+	fmtputc(f, '\'');
+	for(i = 0; i < n; i++){
+		if(s[i] == '\'')
+			fmtputc(f, '\'');
+		fmtputc(f, s[i]);
+	}
+	fmtputc(f, '\'');
+}
+
 static void
 fmtint(Fmt *f, uvlong u, int neg, int base, int upper)
 {
@@ -264,8 +292,11 @@ dofmt(Fmt *f, char *fmt)
 		case 'c':
 			fmtputc(f, va_arg(f->args, int));
 			break;
-		case 's': case 'q':
+		case 's':
 			fmtstr(f, va_arg(f->args, char*));
+			break;
+		case 'q':
+			fmtquote(f, va_arg(f->args, char*));
 			break;
 		case 'r':
 			fmtstr(f, p9errstr());

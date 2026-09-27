@@ -13,7 +13,7 @@ KMOD=	gefs
 SRCS=	gefs_vfsops.c gefs_vnops.c gefs_work.c p9kern.c
 # the core, from 9front
 SRCS+=	p9fmt.c p9err.c avl.c hash.c pack.c blk.c cache.c tree.c snap.c \
-	load.c check.c dump.c error.c sync.c ops.c
+	load.c check.c dump.c error.c sync.c ops.c snapadm.c
 
 CPPFLAGS+=	-I${S}/fs/gefs/compat -I${S}/fs/gefs
 # the core uses Plan 9 C's anonymous struct embedding; kernel stacks

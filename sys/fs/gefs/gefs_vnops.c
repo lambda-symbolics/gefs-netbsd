@@ -1464,6 +1464,28 @@ gefs_print(void *v)
 	return 0;
 }
 
+/* administration (gefs.h): snapshots, the schedule, status */
+static int
+gefs_ioctl(void *v)
+{
+	struct vop_ioctl_args /* {
+		struct vnode *a_vp;
+		u_long a_command;
+		void *a_data;
+		int a_fflag;
+		kauth_cred_t a_cred;
+	} */ *ap = v;
+	struct gefsmount *gm = GMP(ap->a_vp);
+
+	switch(ap->a_command){
+	case GEFSIOC_CTL:
+		return gefs_admin(gm, ap->a_data, 0, ap->a_cred);
+	case GEFSIOC_STATUS:
+		return gefs_admin(gm, ap->a_data, 1, ap->a_cred);
+	}
+	return genfs_enoioctl(v);
+}
+
 static int
 gefs_pathconf(void *v)
 {
@@ -1525,7 +1547,7 @@ static const struct vnodeopv_entry_desc gefs_vnodeop_entries[] = {
 	{ &vop_write_desc,		gefs_write },
 	{ &vop_fallocate_desc,		genfs_eopnotsupp },
 	{ &vop_fdiscard_desc,		genfs_eopnotsupp },
-	{ &vop_ioctl_desc,		genfs_enoioctl },
+	{ &vop_ioctl_desc,		gefs_ioctl },
 	{ &vop_fcntl_desc,		genfs_fcntl },
 	{ &vop_poll_desc,		genfs_poll },
 	{ &vop_kqfilter_desc,		genfs_kqfilter },

@@ -22,6 +22,7 @@ file	fs/gefs/dump.c			gefs
 file	fs/gefs/error.c			gefs
 file	fs/gefs/sync.c			gefs
 file	fs/gefs/ops.c			gefs
+file	fs/gefs/snapadm.c		gefs
 
 makeoptions	gefs	"CPPFLAGS.gefs"+="-I$S/fs/gefs/compat -I$S/fs/gefs"
 makeoptions	gefs	"COPTS.gefs"+="-fplan9-extensions -fconserve-stack"

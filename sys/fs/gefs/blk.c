@@ -738,8 +738,10 @@ getblk(Bptr bp, int flg)
 		qunlock(&fs->blklk[i]);
 		if(flg&GBtry)
 			return nil;
-		else
+		else{
 			aincl(&fs->rdonly, 1);
+			aincl(&fs->broken, 1);	/* NetBSD */
+		}
 		nexterror();
 	}
 	if((b = cacheget(bp.addr)) != nil){
@@ -942,7 +944,7 @@ Again:
 			free(p);
 			break;
 		case DFmnt:
-			free(p);
+			freemount((Mount*)p);	/* NetBSD: and its schedule */
 			break;
 		case DFbp:
 			f = (Bfree*)p;

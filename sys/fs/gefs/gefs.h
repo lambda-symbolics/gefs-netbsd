@@ -1,18 +1,49 @@
 /*
- * GEFS for NetBSD: mount arguments, and the kernel's per-mount and
- * per-vnode state.
+ * GEFS for NetBSD: mount arguments, administration ioctls, and the
+ * kernel's per-device, per-mount and per-vnode state.
  */
 #ifndef _FS_GEFS_GEFS_H_
 #define _FS_GEFS_GEFS_H_
+
+#if defined(_KERNEL) || !defined(__linux__)
+#include <sys/ioccom.h>
+#else
+#include <sys/ioctl.h>	/* the userland tools also build on Linux */
+#endif
 
 #define MOUNT_GEFS	"gefs"
 
 struct gefs_args {
 	char	*fspec;		/* block device */
-	char	snap[64];	/* snapshot label to mount, "" for "main" */
+	char	snap[64];	/* label to mount (a fork or a snapshot), "" for "main" */
 	int	cachemb;	/* block cache in MiB, 0 for the default */
 	int	flags;
 };
+
+/*
+ * Administration, as 9front's adm/ctl and adm/status: an ioctl on any
+ * file or directory of a mounted gefs.  GEFSIOC_CTL runs one command:
+ *
+ *	snap label new		snapshot label as new (read-only)
+ *	fork label new		the same, mutable
+ *	delsnap label		delete a label
+ *	retain label spec...	automatic snapshots of label ("-": default),
+ *				e.g. "60@m 24@h 14@d", "none", "default"
+ *	sync			commit everything now
+ *	check			check the whole file system
+ *	usereserve 0|1		allow the reserve, to delete when full
+ *
+ * If it fails and gc_buf is set, the reason goes there.  GEFSIOC_STATUS
+ * copies out the status text (usage, retention, labels), and sets gc_len
+ * to its length, which may exceed the buffer.
+ */
+struct gefs_ctl {
+	char	gc_cmd[256];
+	char	*gc_buf;
+	size_t	gc_len;
+};
+#define GEFSIOC_CTL	_IOWR('G', 1, struct gefs_ctl)
+#define GEFSIOC_STATUS	_IOWR('G', 2, struct gefs_ctl)
 
 #ifdef _KERNEL
 
@@ -22,28 +53,47 @@ struct gefs_args {
 #define GEFS_NREADERS	2
 
 struct gefsjob;
+struct gefsmount;
 TAILQ_HEAD(gefsjobq, gefsjob);
 
-struct gefsmount {
-	struct mount	*gm_mp;
-	struct vnode	*gm_devvp;
-	struct Gefs	*gm_fs;		/* the core's file system */
-	struct Mount	*gm_mnt;	/* the snapshot label mounted */
-	struct Dent	*gm_rootde;
-	int		gm_fd;		/* device slot, p9kern.c */
-	int		gm_ronly;
-	int		gm_openmode;	/* FREAD, or FREAD|FWRITE */
-	char		gm_label[64];
+/*
+ * One per device: the core's file system and the threads that change
+ * it.  Every label mounted from the device shares it (a fork on
+ * /usr/obj, a snapshot on /mnt, next to main on /), as 9front serves
+ * all labels from one file server.
+ */
+struct gefsdev {
+	LIST_ENTRY(gefsdev) gd_link;
+	dev_t		gd_dev;
+	struct vnode	*gd_devvp;
+	struct Gefs	*gd_fs;		/* the core's file system */
+	int		gd_fd;		/* device slot, p9kern.c */
+	int		gd_openmode;	/* FREAD, or FREAD|FWRITE */
+	int		gd_nrw;		/* read-write mounts; on the mutator */
+	int		gd_busy;	/* a mount or unmount in progress */
+	LIST_HEAD(, gefsmount) gd_mounts;
 	/* the mutator and reader threads, gefs_work.c */
-	kmutex_t	gm_jlk;
-	kcondvar_t	gm_mcv;		/* work for the mutator */
-	kcondvar_t	gm_rcv;		/* work for the readers */
-	kcondvar_t	gm_dcv;		/* a job is done, a thread left */
-	struct gefsjobq	gm_mq;
-	struct gefsjobq	gm_rq;
-	int		gm_nthreads;
-	int		gm_stop;
-	volatile int	gm_lazyq;	/* a lazy commit is queued */
+	kmutex_t	gd_jlk;
+	kcondvar_t	gd_mcv;		/* work for the mutator */
+	kcondvar_t	gd_rcv;		/* work for the readers */
+	kcondvar_t	gd_dcv;		/* a job is done, a thread left */
+	struct gefsjobq	gd_mq;
+	struct gefsjobq	gd_rq;
+	int		gd_nthreads;
+	int		gd_stop;
+	volatile int	gd_lazyq;	/* a lazy commit is queued */
+};
+
+/* One per NetBSD mount: a label of a device. */
+struct gefsmount {
+	LIST_ENTRY(gefsmount) gm_link;	/* on gd_mounts */
+	struct mount	*gm_mp;
+	struct gefsdev	*gm_gd;
+	struct Gefs	*gm_fs;		/* gm_gd->gd_fs */
+	struct Mount	*gm_mnt;	/* the label mounted */
+	struct Dent	*gm_rootde;
+	int		gm_ronly;
+	char		gm_label[64];
 };
 
 struct gefsnode {
@@ -77,10 +127,11 @@ int	gefsdevadd(struct vnode *, long long);
 void	gefsdevdel(int);
 void	gefsdevpend(int);
 void	gefsdevstats(int, long long *, long long *, long long *);
+int	p9capture(char *, int);
 
 /* gefs_work.c */
-int	gefs_work_start(struct gefsmount *);
-void	gefs_work_stop(struct gefsmount *);
+int	gefs_work_start(struct gefsdev *);
+void	gefs_work_stop(struct gefsdev *);
 int	gefs_call(struct gefsmount *, void (*)(struct gefsmount *, void *), void *);
 void	gefs_post(struct gefsmount *, void (*)(struct gefsmount *, void *), void *);
 void	gefs_queuebuf(struct gefsmount *, struct vnode *, struct buf *);
@@ -88,6 +139,8 @@ void	gefs_queuebuf(struct gefsmount *, struct vnode *, struct buf *);
 /* gefs_vfsops.c */
 int	gefs_vnget(struct mount *, struct Dent *, struct vnode **);
 int	gefs_commit(struct gefsmount *, int, int);
+int	gefs_putall(struct mount *, int);
+int	gefs_admin(struct gefsmount *, struct gefs_ctl *, int, kauth_cred_t);
 void	gefs_freefs(struct Gefs *);
 
 /*

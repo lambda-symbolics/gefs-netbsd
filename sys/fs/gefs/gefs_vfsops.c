@@ -17,6 +17,7 @@
 #include <sys/fcntl.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/conf.h>
 #include <miscfs/genfs/genfs.h>
 #include <miscfs/specfs/specdev.h>
 
@@ -109,7 +110,6 @@ gefs_freefs(Gefs *f)
 	Bfree *bf, *nbf;
 	Arange *r, *nr;
 	Dlist *dl, *ndl;
-	Blk *b, *nb;
 	Arena *a;
 	int i;
 
@@ -119,7 +119,6 @@ gefs_freefs(Gefs *f)
 	for(i = 0; i < f->cmax; i++)
 		free(f->blkall[i]);
 	free(f->blkall);
-	USED(b, nb);
 	for(i = 0; i < f->narena; i++){
 		a = &f->arenas[i];
 		if(a->free != nil){
@@ -151,47 +150,94 @@ gefs_freefs(Gefs *f)
 	p9setfs(nil);
 }
 
-/* on the mutator: load the file system and the label */
+/*
+ * Mounts and devices.  The first label mounted from a device opens it
+ * and loads the file system; more labels share it; the last unmount
+ * writes everything out and closes it.  gefs_mntlock orders mounts and
+ * unmounts, and guards the lists.
+ */
+static krwlock_t	gefs_mntlock;
+static LIST_HEAD(, gefsdev) gefs_devs = LIST_HEAD_INITIALIZER(gefs_devs);
+
+/*
+ * On the mutator: load the file system (for the first label, arg set),
+ * then the label.  A label is mounted once: two NetBSD mounts of one
+ * tree would cache its pages twice.  "dump", 9front's view of all the
+ * snapshots, is not a label here.
+ */
 static void
 gefs_loadjob(struct gefsmount *gm, void *arg)
 {
+	struct gefsdev *gd = gm->gm_gd;
+	struct gefsmount *o;
 	int i;
 
-	USED(arg);
-	gefsdevpend(gm->gm_fd);
-	loadfs("gefs");
-	for(i = 0; i < fs->narena; i++)
-		fs->arenas[i].sync = &fs->syncq[i%fs->nsyncers];
+	if(arg != NULL){
+		gefsdevpend(gd->gd_fd);
+		loadfs("gefs");
+		for(i = 0; i < fs->narena; i++)
+			fs->arenas[i].sync = &fs->syncq[i%fs->nsyncers];
+	}
+	if(strcmp(gm->gm_label, "dump") == 0)
+		gefserr(Eimpl);
+	LIST_FOREACH(o, &gd->gd_mounts, gm_link)
+		if(strcmp(o->gm_label, gm->gm_label) == 0)
+			gefserr(Esnapu);
+	if(!gm->gm_ronly && agetl(&fs->broken))
+		gefserr(Erdonly);
 	gm->gm_mnt = getmount(gm->gm_label);
-	if(!gm->gm_ronly && !(gm->gm_mnt->flag & Lmut)){
+	if(waserror()){
+		if(gm->gm_rootde != nil)
+			clunkdent(gm->gm_mnt, gm->gm_rootde);
+		gm->gm_rootde = nil;
 		clunkmount(gm->gm_mnt);
 		gm->gm_mnt = nil;
-		gefserr(Erdonly);
+		if(!gm->gm_ronly && gd->gd_nrw == 0)
+			aswapl(&fs->rdonly, 1);
+		nexterror();
 	}
+	if(!gm->gm_ronly && !(gm->gm_mnt->flag & Lmut))
+		gefserr(Erdonly);
 	gm->gm_rootde = gefsroot(gm->gm_mnt);
-	if(!gm->gm_ronly)
+	if(!gm->gm_ronly){
+		if(gd->gd_nrw == 0)
+			aswapl(&fs->rdonly, 0);
 		gefsorphans(gm->gm_mnt);
+		gd->gd_nrw++;
+	}
+	poperror();
 }
 
-/* on the mutator: everything to the disk, and let go of the label */
+/*
+ * On the mutator: everything to the disk, and let go of the label.
+ * The commit is for the whole file system; it goes before the label is
+ * let go of, as a commit only takes the labels still mounted.
+ */
 static void
 gefs_unloadjob(struct gefsmount *gm, void *arg)
 {
+	struct gefsdev *gd = gm->gm_gd;
+
 	USED(arg);
 	if(!gm->gm_ronly && !agetl(&fs->rdonly))
 		drainsyncq();
 	clunkdent(gm->gm_mnt, gm->gm_rootde);
 	clunkmount(gm->gm_mnt);
+	if(!gm->gm_ronly && --gd->gd_nrw == 0)
+		aswapl(&fs->rdonly, 1);
 }
 
 /* on the mutator: read-only to read-write (the root, once rc has run fsck) */
 static void
 gefs_rwjob(struct gefsmount *gm, void *arg)
 {
+	struct gefsdev *gd = gm->gm_gd;
+
 	USED(arg);
-	if(!(gm->gm_mnt->flag & Lmut))
+	if(!(gm->gm_mnt->flag & Lmut) || agetl(&fs->broken))
 		gefserr(Erdonly);
-	aswapl(&fs->rdonly, 0);
+	if(gd->gd_nrw++ == 0)
+		aswapl(&fs->rdonly, 0);
 	gm->gm_ronly = 0;
 	gefsorphans(gm->gm_mnt);
 }
@@ -200,10 +246,13 @@ gefs_rwjob(struct gefsmount *gm, void *arg)
 static void
 gefs_rojob(struct gefsmount *gm, void *arg)
 {
+	struct gefsdev *gd = gm->gm_gd;
+
 	USED(arg);
 	drainsyncq();
-	aswapl(&fs->rdonly, 1);
 	gm->gm_ronly = 1;
+	if(--gd->gd_nrw == 0)
+		aswapl(&fs->rdonly, 1);
 }
 
 static void
@@ -211,7 +260,7 @@ gefs_commitjob(struct gefsmount *gm, void *arg)
 {
 	int flags = (int)(intptr_t)arg;
 
-	gm->gm_lazyq = 0;
+	gm->gm_gd->gd_lazyq = 0;
 	commit(flags);
 }
 
@@ -219,20 +268,62 @@ gefs_commitjob(struct gefsmount *gm, void *arg)
 int
 gefs_commit(struct gefsmount *gm, int wait, int flags)
 {
+	struct gefsdev *gd = gm->gm_gd;
+
 	if(wait)
 		return gefs_call(gm, gefs_commitjob, (void*)(intptr_t)flags);
-	if(!gm->gm_lazyq){
-		gm->gm_lazyq = 1;
+	if(!gd->gd_lazyq){
+		gd->gd_lazyq = 1;
 		gefs_post(gm, gefs_commitjob, (void*)(intptr_t)flags);
 	}
 	return 0;
 }
 
-static int
-gefs_mountfs(struct vnode *devvp, struct mount *mp, struct lwp *l,
-    struct gefs_args *args)
+static struct gefsmount*
+gefs_newgm(struct gefsdev *gd, struct mount *mp, struct gefs_args *args)
 {
 	struct gefsmount *gm;
+
+	gm = kmem_zalloc(sizeof(*gm), KM_SLEEP);
+	gm->gm_mp = mp;
+	gm->gm_gd = gd;
+	gm->gm_fs = gd->gd_fs;
+	gm->gm_ronly = (mp->mnt_flag & MNT_RDONLY) != 0;
+	strlcpy(gm->gm_label, args->snap[0] ? args->snap : "main",
+	    sizeof(gm->gm_label));
+	return gm;
+}
+
+/* the NetBSD side of a mounted label */
+static void
+gefs_setupmp(struct gefsmount *gm, struct mount *mp, int first)
+{
+	struct gefsdev *gd = gm->gm_gd;
+
+	mp->mnt_data = gm;
+	if(first){
+		mp->mnt_stat.f_fsidx.__fsid_val[0] = (long)gd->gd_dev;
+		mp->mnt_stat.f_fsidx.__fsid_val[1] = makefstype(MOUNT_GEFS);
+		mp->mnt_stat.f_fsid = mp->mnt_stat.f_fsidx.__fsid_val[0];
+	}else{
+		/* labels share qids (a fork has its base's): st_dev tells them apart */
+		vfs_getnewfsid(mp);
+	}
+	mp->mnt_stat.f_namemax = Maxname;
+	mp->mnt_flag |= MNT_LOCAL;
+	mp->mnt_iflag |= IMNT_MPSAFE;
+	mp->mnt_fs_bshift = Lgblk;
+	mp->mnt_dev_bshift = DEV_BSHIFT;
+	LIST_INSERT_HEAD(&gd->gd_mounts, gm, gm_link);
+}
+
+/* the first label of a device: open the file system; with gefs_mntlock */
+static int
+gefs_mountfs(struct vnode *devvp, struct mount *mp, struct lwp *l,
+    struct gefs_args *args, int openmode)
+{
+	struct gefsmount *gm;
+	struct gefsdev *gd;
 	uint64_t psize;
 	unsigned secsize;
 	vlong csz;
@@ -246,44 +337,52 @@ gefs_mountfs(struct vnode *devvp, struct mount *mp, struct lwp *l,
 	if((error = getdisksize(devvp, &psize, &secsize)) != 0)
 		return error;
 
-	gm = kmem_zalloc(sizeof(*gm), KM_SLEEP);
-	gm->gm_mp = mp;
-	gm->gm_devvp = devvp;
-	gm->gm_ronly = (mp->mnt_flag & MNT_RDONLY) != 0;
-	gm->gm_openmode = gm->gm_ronly ? FREAD : FREAD|FWRITE;
-	strlcpy(gm->gm_label, args->snap[0] ? args->snap : "main",
-	    sizeof(gm->gm_label));
-	gm->gm_fd = gefsdevadd(devvp, (long long)psize * secsize);
-	if(gm->gm_fd < 0){
-		kmem_free(gm, sizeof(*gm));
+	gd = kmem_zalloc(sizeof(*gd), KM_SLEEP);
+	gd->gd_dev = devvp->v_rdev;
+	gd->gd_devvp = devvp;
+	gd->gd_openmode = openmode;
+	LIST_INIT(&gd->gd_mounts);
+	gd->gd_fd = gefsdevadd(devvp, (long long)psize * secsize);
+	if(gd->gd_fd < 0){
+		kmem_free(gd, sizeof(*gd));
 		return EMFILE;
 	}
 	csz = (vlong)(args->cachemb > 0 ? args->cachemb : gefs_cachemb) * MiB;
-	gm->gm_fs = gefs_newfs(csz, gm->gm_ronly);
+	gd->gd_fs = gefs_newfs(csz, 1);
 	p9setfs(nil);
-	if((error = gefs_work_start(gm)) == 0){
-		error = gefs_call(gm, gefs_loadjob, NULL);
+	gm = gefs_newgm(gd, mp, args);
+	if((error = gefs_work_start(gd)) == 0){
+		error = gefs_call(gm, gefs_loadjob, gd);
 		if(error)
-			gefs_work_stop(gm);
+			gefs_work_stop(gd);
 	}
 	if(error){
 		printf("gefs: mount %s: error %d\n", gm->gm_label, error);
-		gefs_freefs(gm->gm_fs);
-		gefsdevdel(gm->gm_fd);
+		gefs_freefs(gd->gd_fs);
+		gefsdevdel(gd->gd_fd);
+		kmem_free(gm, sizeof(*gm));
+		kmem_free(gd, sizeof(*gd));
+		return error;
+	}
+	LIST_INSERT_HEAD(&gefs_devs, gd, gd_link);
+	gefs_setupmp(gm, mp, 1);
+	spec_node_setmountedfs(devvp, mp);
+	return 0;
+}
+
+/* another label of a device that is mounted; with gefs_mntlock */
+static int
+gefs_mountlabel(struct gefsdev *gd, struct mount *mp, struct gefs_args *args)
+{
+	struct gefsmount *gm;
+	int error;
+
+	gm = gefs_newgm(gd, mp, args);
+	if((error = gefs_call(gm, gefs_loadjob, NULL)) != 0){
 		kmem_free(gm, sizeof(*gm));
 		return error;
 	}
-
-	mp->mnt_data = gm;
-	mp->mnt_stat.f_fsidx.__fsid_val[0] = (long)devvp->v_rdev;
-	mp->mnt_stat.f_fsidx.__fsid_val[1] = makefstype(MOUNT_GEFS);
-	mp->mnt_stat.f_fsid = mp->mnt_stat.f_fsidx.__fsid_val[0];
-	mp->mnt_stat.f_namemax = Maxname;
-	mp->mnt_flag |= MNT_LOCAL;
-	mp->mnt_iflag |= IMNT_MPSAFE;
-	mp->mnt_fs_bshift = Lgblk;
-	mp->mnt_dev_bshift = DEV_BSHIFT;
-	spec_node_setmountedfs(devvp, mp);
+	gefs_setupmp(gm, mp, 0);
 	return 0;
 }
 
@@ -293,6 +392,7 @@ gefs_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 	struct lwp *l = curlwp;
 	struct gefs_args *args = data;
 	struct gefsmount *gm;
+	struct gefsdev *gd;
 	struct vnode *devvp;
 	int error, xflags;
 
@@ -310,21 +410,19 @@ gefs_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 		gm = VFSTOGEFS(mp);
 		if(gm == NULL)
 			return EINVAL;
+		error = 0;
+		rw_enter(&gefs_mntlock, RW_WRITER);
 		if(gm->gm_ronly && (mp->mnt_iflag & IMNT_WANTRDWR)){
 			/* the root is mounted read-only; rc makes it writable */
 			error = gefs_call(gm, gefs_rwjob, NULL);
-			if(error)
-				return error;
 		}else if(!gm->gm_ronly && (mp->mnt_flag & MNT_RDONLY)){
 			error = vflush(mp, NULLVP,
 			    (mp->mnt_flag & MNT_FORCE) ? FORCECLOSE : 0);
-			if(error)
-				return error;
-			error = gefs_call(gm, gefs_rojob, NULL);
-			if(error)
-				return error;
+			if(error == 0)
+				error = gefs_call(gm, gefs_rojob, NULL);
 		}
-		return 0;
+		rw_exit(&gefs_mntlock);
+		return error;
 	}
 	if(args->fspec == NULL)
 		return EINVAL;
@@ -351,20 +449,36 @@ gefs_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 		vrele(devvp);
 		return error;
 	}
-	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-	error = VOP_OPEN(devvp, xflags, FSCRED);
-	VOP_UNLOCK(devvp);
-	if(error){
+
+	rw_enter(&gefs_mntlock, RW_WRITER);
+	LIST_FOREACH(gd, &gefs_devs, gd_link)
+		if(gd->gd_dev == devvp->v_rdev)
+			break;
+	if(gd != NULL){
+		/* the device is open: mount another of its labels */
 		vrele(devvp);
-		return error;
-	}
-	error = gefs_mountfs(devvp, mp, l, args);
-	if(error){
+		error = gefs_mountlabel(gd, mp, args);
+		rw_exit(&gefs_mntlock);
+		if(error)
+			return error;
+	}else{
 		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-		(void)VOP_CLOSE(devvp, xflags, NOCRED);
+		error = VOP_OPEN(devvp, xflags, FSCRED);
 		VOP_UNLOCK(devvp);
-		vrele(devvp);
-		return error;
+		if(error){
+			rw_exit(&gefs_mntlock);
+			vrele(devvp);
+			return error;
+		}
+		error = gefs_mountfs(devvp, mp, l, args, xflags);
+		rw_exit(&gefs_mntlock);
+		if(error){
+			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+			(void)VOP_CLOSE(devvp, xflags, NOCRED);
+			VOP_UNLOCK(devvp);
+			vrele(devvp);
+			return error;
+		}
 	}
 	return set_statvfs_info(path, UIO_USERSPACE, args->fspec, UIO_USERSPACE,
 	    mp->mnt_op->vfs_name, mp, l);
@@ -379,37 +493,53 @@ gefs_start(struct mount *mp, int flags)
 static int
 gefs_unmount(struct mount *mp, int mntflags)
 {
-	struct gefsmount *gm = VFSTOGEFS(mp);
+	struct gefsmount *gm = VFSTOGEFS(mp), *o;
+	struct gefsdev *gd = gm->gm_gd;
 	struct vnode *devvp;
+	long long r, w, f;
 	int error, flags;
 
 	flags = (mntflags & MNT_FORCE) ? FORCECLOSE : 0;
 	if((error = vflush(mp, NULLVP, flags)) != 0)
 		return error;
+	rw_enter(&gefs_mntlock, RW_WRITER);
 	error = gefs_call(gm, gefs_unloadjob, NULL);
 	if(error){
 		printf("gefs: unmount %s: error %d\n", gm->gm_label, error);
-		if(!(mntflags & MNT_FORCE))
+		if(!(mntflags & MNT_FORCE)){
+			rw_exit(&gefs_mntlock);
 			return error;
+		}
 	}
-	gefs_work_stop(gm);
-	{
-		long long r, w, f;
-
-		gefsdevstats(gm->gm_fd, &r, &w, &f);
-		printf("gefs: %s unmounted: %lld commits, %lld skipped as clean; "
-		    "device %lld reads, %lld writes, %lld cache flushes\n",
-		    gm->gm_label, (long long)gm->gm_fs->ncommit,
-		    (long long)gm->gm_fs->nskip, r, w, f);
+	LIST_REMOVE(gm, gm_link);
+	devvp = gd->gd_devvp;
+	if(!LIST_EMPTY(&gd->gd_mounts)){
+		/* other labels stay mounted */
+		if(spec_node_getmountedfs(devvp) == mp){
+			o = LIST_FIRST(&gd->gd_mounts);
+			spec_node_setmountedfs(devvp, o->gm_mp);
+		}
+		printf("gefs: %s unmounted\n", gm->gm_label);
+		rw_exit(&gefs_mntlock);
+		goto out;
 	}
-	gefs_freefs(gm->gm_fs);
+	LIST_REMOVE(gd, gd_link);
+	rw_exit(&gefs_mntlock);
 
-	devvp = gm->gm_devvp;
+	gefs_work_stop(gd);
+	gefsdevstats(gd->gd_fd, &r, &w, &f);
+	printf("gefs: %s unmounted: %lld commits, %lld skipped as clean; "
+	    "device %lld reads, %lld writes, %lld cache flushes\n",
+	    gm->gm_label, (long long)gd->gd_fs->ncommit,
+	    (long long)gd->gd_fs->nskip, r, w, f);
+	gefs_freefs(gd->gd_fs);
 	spec_node_setmountedfs(devvp, NULL);
 	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-	(void)VOP_CLOSE(devvp, gm->gm_openmode, NOCRED);
+	(void)VOP_CLOSE(devvp, gd->gd_openmode, NOCRED);
 	vput(devvp);
-	gefsdevdel(gm->gm_fd);
+	gefsdevdel(gd->gd_fd);
+	kmem_free(gd, sizeof(*gd));
+out:
 	kmem_free(gm, sizeof(*gm));
 	mp->mnt_data = NULL;
 	mp->mnt_flag &= ~MNT_LOCAL;
@@ -476,44 +606,179 @@ gefs_sync_selector(void *cl, struct vnode *vp)
 }
 
 /*
+ * Dirty pages into the tree (not to the disk: a commit does that).
+ * Waiting, busy vnodes are waited for and the writes are waited for.
+ */
+int
+gefs_putall(struct mount *mp, int wait)
+{
+	struct vnode_iterator *marker;
+	struct vnode *vp;
+
+	vfs_vnode_iterator_init(mp, &marker);
+	while((vp = vfs_vnode_iterator_next(marker, gefs_sync_selector, NULL)) != NULL){
+		if(vn_lock(vp, LK_EXCLUSIVE | (wait ? 0 : LK_NOWAIT)) != 0){
+			vrele(vp);
+			continue;
+		}
+		rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
+		(void)VOP_PUTPAGES(vp, 0, 0, PGO_ALLPAGES | PGO_CLEANIT |
+		    (wait ? PGO_SYNCIO : 0));
+		vput(vp);
+	}
+	vfs_vnode_iterator_destroy(marker);
+	return 0;
+}
+
+/*
  * The syncer calls this every syncdelay seconds (MNT_LAZY), sync(2) with
- * MNT_WAIT.  Dirty pages go into the tree first, so data and metadata
- * reach the disk in one commit; a clean file system writes nothing.
+ * MNT_NOWAIT, unmount and shutdown with MNT_WAIT.  Dirty pages go into
+ * the tree first, so data and metadata reach the disk in one commit; a
+ * clean file system writes nothing.
  */
 static int
 gefs_sync(struct mount *mp, int waitfor, kauth_cred_t cred)
 {
 	struct gefsmount *gm = VFSTOGEFS(mp);
-	struct vnode_iterator *marker;
-	struct vnode *vp;
-	int error, flags;
 
 	if(gm->gm_ronly)
 		return 0;
-	flags = (waitfor == MNT_WAIT) ? FSYNC_WAIT : FSYNC_LAZY;
-	vfs_vnode_iterator_init(mp, &marker);
-	while((vp = vfs_vnode_iterator_next(marker, gefs_sync_selector, NULL)) != NULL){
-		if(vn_lock(vp, LK_EXCLUSIVE | LK_NOWAIT) != 0){
-			vrele(vp);
-			continue;
-		}
-		/* data only: the commit follows once for everything */
-		rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
-		(void)VOP_PUTPAGES(vp, 0, 0, PGO_ALLPAGES | PGO_CLEANIT |
-		    (waitfor == MNT_WAIT ? PGO_SYNCIO : 0));
-		vput(vp);
-	}
-	vfs_vnode_iterator_destroy(marker);
-	USED(flags);
-
+	/* data only, not waiting for busy vnodes: the commit follows once */
+	gefs_putall(mp, 0);
 	/*
 	 * The page writes above are queued on the mutator; the commit goes
 	 * after them.  The syncer does not wait for it.
 	 */
 	if(waitfor == MNT_WAIT)
-		error = gefs_commit(gm, 1, Clazy);
-	else
-		error = gefs_commit(gm, 0, 0);
+		return gefs_commit(gm, 1, Clazy);
+	return gefs_commit(gm, 0, 0);
+}
+
+/* --- administration: GEFSIOC_CTL and GEFSIOC_STATUS --- */
+
+struct ctlargs {
+	char	*cmd;
+	int	status;
+	char	*text;		/* the status text, from the core's malloc */
+	long	ntext;
+	char	*out;		/* the check's findings, then any error */
+	int	outsz;
+	int	nout;
+	int	error;
+};
+
+static void
+gefs_ctljob(struct gefsmount *gm, void *arg)
+{
+	struct ctlargs *c = arg;
+	char *e;
+	long sz;
+
+	USED(gm);
+	if(waserror()){
+		c->nout = p9capture(nil, 0);
+		c->error = gefserrno(errmsg());
+		if(c->out != nil)
+			c->nout += snprint(c->out + c->nout, c->outsz - c->nout,
+			    "%s\n", errmsg());
+		return;
+	}
+	if(c->status){
+		for(sz = 16*KiB; ; sz *= 4){
+			c->text = emalloc(sz, 0);
+			epochstart(0);
+			if(waserror()){
+				epochend(0);
+				nexterror();
+			}
+			e = seprintstatus(c->text, c->text + sz);
+			epochend(0);
+			poperror();
+			if(e < c->text + sz - 1 || sz >= 4*MiB)
+				break;
+			free(c->text);
+			c->text = nil;
+		}
+		c->ntext = e - c->text;
+	}else{
+		/* the check's findings go to the caller; room is left for an error */
+		p9capture(c->out, c->outsz - 1024);
+		ctlcmd(c->cmd, 2);
+		c->nout = p9capture(nil, 0);
+	}
+	poperror();
+}
+
+/*
+ * An administration request on a file of mp, from VOP_IOCTL.  Snapshots
+ * take the state the files have now: for snap and fork of a mounted
+ * label, and for sync, the dirty pages go into the trees first.
+ */
+int
+gefs_admin(struct gefsmount *gm, struct gefs_ctl *gc, int status, kauth_cred_t cred)
+{
+	struct gefsdev *gd = gm->gm_gd;
+	struct gefsmount *o;
+	struct ctlargs c;
+	char buf[256], *w[3];
+	int error, nw;
+	size_t n;
+
+	memset(&c, 0, sizeof(c));
+	if(status){
+		c.status = 1;
+		error = gefs_call(gm, gefs_ctljob, &c);
+		if(error == 0 && (error = c.error) == 0){
+			n = MIN(gc->gc_len, (size_t)c.ntext);
+			if(gc->gc_buf != NULL && n > 0)
+				error = copyout(c.text, gc->gc_buf, n);
+			gc->gc_len = c.ntext;
+		}
+		if(c.text != NULL){
+			struct Gefs *ofs = fs;
+
+			p9setfs(gm->gm_fs);
+			free(c.text);
+			p9setfs(ofs);
+		}
+		return error;
+	}
+
+	/*
+	 * Changing the labels is changing the mount: root, or the owner of a
+	 * user mount; not at securelevel 2.  (KAUTH_SYSTEM_FS_SNAPSHOT is
+	 * FFS's: its listener takes any vnode for an FFS inode.)
+	 */
+	error = kauth_authorize_system(cred, KAUTH_SYSTEM_MOUNT,
+	    KAUTH_REQ_SYSTEM_MOUNT_UPDATE, gm->gm_mp,
+	    KAUTH_ARG(gm->gm_mp->mnt_flag), NULL);
+	if(error)
+		return error;
+	gc->gc_cmd[sizeof(gc->gc_cmd)-1] = 0;
+	strlcpy(buf, gc->gc_cmd, sizeof(buf));
+	nw = ctltokenize(buf, w, nelem(w));
+	rw_enter(&gefs_mntlock, RW_READER);
+	LIST_FOREACH(o, &gd->gd_mounts, gm_link){
+		if(o->gm_ronly)
+			continue;
+		if((nw == 1 && strcmp(w[0], "sync") == 0)
+		|| (nw == 3 && (strcmp(w[0], "snap") == 0 || strcmp(w[0], "fork") == 0)
+		    && strcmp(w[1], o->gm_label) == 0))
+			gefs_putall(o->gm_mp, 1);
+	}
+	rw_exit(&gefs_mntlock);
+
+	c.cmd = gc->gc_cmd;
+	c.outsz = 16*1024;
+	c.out = kmem_zalloc(c.outsz, KM_SLEEP);
+	error = gefs_call(gm, gefs_ctljob, &c);
+	if(error == 0)
+		error = c.error;
+	/* with the NUL: when the ioctl fails, gc_len does not come back */
+	if(gc->gc_buf != NULL && gc->gc_len > 0 && c.nout > 0)
+		(void)copyout(c.out, gc->gc_buf, MIN(gc->gc_len, (size_t)c.nout + 1));
+	gc->gc_len = c.nout;
+	kmem_free(c.out, c.outsz);
 	return error;
 }
 
@@ -595,7 +860,10 @@ gefs_mountroot(void)
 	}
 	memset(&args, 0, sizeof(args));
 	mp->mnt_flag |= MNT_FORCE;
-	if((error = gefs_mountfs(rootvp, mp, l, &args)) != 0){
+	rw_enter(&gefs_mntlock, RW_WRITER);
+	error = gefs_mountfs(rootvp, mp, l, &args, FREAD);
+	rw_exit(&gefs_mntlock);
+	if(error){
 		vfs_unbusy(mp);
 		vfs_rele(mp);
 		return error;
@@ -624,6 +892,7 @@ gefs_vptofh(struct vnode *vp, struct fid *fhp, size_t *fh_size)
 static void
 gefs_init(void)
 {
+	rw_init(&gefs_mntlock);
 #ifndef _MODULE
 	/* built in: no module command to set up the compatibility layer */
 	if(p9kinit() != 0)
@@ -634,6 +903,7 @@ gefs_init(void)
 static void
 gefs_done(void)
 {
+	rw_destroy(&gefs_mntlock);
 }
 
 static int

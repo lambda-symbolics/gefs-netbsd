@@ -4,10 +4,12 @@
  * amd64 kernel stacks are 12 KiB, and the core's deeper paths (a
  * commit, or a page write that splits tree nodes and allocates blocks)
  * do not fit under a VFS call chain.  As on 9front, where a mutator proc
- * and reader procs did the work, each mount has a mutator thread for
- * everything that changes the tree (it holds fs->mutlk anyway) and a
+ * and reader procs did the work, each device has a mutator thread for
+ * everything that changes the trees (it holds fs->mutlk anyway) and a
  * couple of reader threads for page-in I/O; they start with empty
- * stacks.  Lookups, getattr and readdir stay in the caller.
+ * stacks.  Lookups, getattr and readdir stay in the caller.  All the
+ * labels mounted from a device share its threads; a job carries the
+ * mount it is for.
  */
 #include <sys/cdefs.h>
 #include <sys/param.h>
@@ -32,6 +34,7 @@
 
 struct gefsjob {
 	TAILQ_ENTRY(gefsjob) j_link;
+	struct gefsmount *j_gm;
 	struct buf	*j_bp;		/* page I/O, or */
 	struct vnode	*j_vp;
 	void		(*j_fn)(struct gefsmount *, void *);	/* a call */
@@ -67,20 +70,20 @@ gefs_bufio(struct gefsmount *gm, struct vnode *vp, struct buf *bp)
 }
 
 static void
-gefs_runjob(struct gefsmount *gm, struct gefsjob *j)
+gefs_runjob(struct gefsdev *gd, struct gefsjob *j)
 {
 	struct buf *bp;
 	int error;
 
 	error = 0;
-	p9setfs(gm->gm_fs);
+	p9setfs(gd->gd_fs);
 	if(waserror()){
 		error = gefserrno(errmsg());
 	}else{
 		if(j->j_bp != NULL)
-			gefs_bufio(gm, j->j_vp, j->j_bp);
+			gefs_bufio(j->j_gm, j->j_vp, j->j_bp);
 		else
-			j->j_fn(gm, j->j_arg);
+			j->j_fn(j->j_gm, j->j_arg);
 		poperror();
 	}
 	p9setfs(nil);
@@ -90,111 +93,113 @@ gefs_runjob(struct gefsmount *gm, struct gefsjob *j)
 		bp->b_resid = 0;
 		biodone(bp);
 	}else if(j->j_wait){
-		mutex_enter(&gm->gm_jlk);
+		mutex_enter(&gd->gd_jlk);
 		j->j_error = error;
 		j->j_done = 1;
-		cv_broadcast(&gm->gm_dcv);
-		mutex_exit(&gm->gm_jlk);
+		cv_broadcast(&gd->gd_dcv);
+		mutex_exit(&gd->gd_jlk);
 	}else
 		kmem_free(j, sizeof(*j));
 }
 
 static void
-gefs_thread(struct gefsmount *gm, struct gefsjobq *q, kcondvar_t *cv)
+gefs_thread(struct gefsdev *gd, struct gefsjobq *q, kcondvar_t *cv)
 {
 	struct gefsjob *j;
 
 	for(;;){
-		mutex_enter(&gm->gm_jlk);
-		while(TAILQ_EMPTY(q) && !gm->gm_stop)
-			cv_wait(cv, &gm->gm_jlk);
+		mutex_enter(&gd->gd_jlk);
+		while(TAILQ_EMPTY(q) && !gd->gd_stop)
+			cv_wait(cv, &gd->gd_jlk);
 		if(TAILQ_EMPTY(q)){
-			gm->gm_nthreads--;
-			cv_broadcast(&gm->gm_dcv);
-			mutex_exit(&gm->gm_jlk);
+			gd->gd_nthreads--;
+			cv_broadcast(&gd->gd_dcv);
+			mutex_exit(&gd->gd_jlk);
 			kthread_exit(0);
 		}
 		j = TAILQ_FIRST(q);
 		TAILQ_REMOVE(q, j, j_link);
-		mutex_exit(&gm->gm_jlk);
-		gefs_runjob(gm, j);
+		mutex_exit(&gd->gd_jlk);
+		gefs_runjob(gd, j);
 	}
 }
 
 static void
 gefs_mutator(void *arg)
 {
-	struct gefsmount *gm = arg;
+	struct gefsdev *gd = arg;
 
-	gefs_thread(gm, &gm->gm_mq, &gm->gm_mcv);
+	gefs_thread(gd, &gd->gd_mq, &gd->gd_mcv);
 }
 
 static void
 gefs_reader(void *arg)
 {
-	struct gefsmount *gm = arg;
+	struct gefsdev *gd = arg;
 
-	gefs_thread(gm, &gm->gm_rq, &gm->gm_rcv);
+	gefs_thread(gd, &gd->gd_rq, &gd->gd_rcv);
 }
 
 int
-gefs_work_start(struct gefsmount *gm)
+gefs_work_start(struct gefsdev *gd)
 {
 	int error, i;
 
-	mutex_init(&gm->gm_jlk, MUTEX_DEFAULT, IPL_NONE);
-	cv_init(&gm->gm_mcv, "gefsmut");
-	cv_init(&gm->gm_rcv, "gefsrd");
-	cv_init(&gm->gm_dcv, "gefsjob");
-	TAILQ_INIT(&gm->gm_mq);
-	TAILQ_INIT(&gm->gm_rq);
-	gm->gm_stop = 0;
-	gm->gm_nthreads = 0;
+	mutex_init(&gd->gd_jlk, MUTEX_DEFAULT, IPL_NONE);
+	cv_init(&gd->gd_mcv, "gefsmut");
+	cv_init(&gd->gd_rcv, "gefsrd");
+	cv_init(&gd->gd_dcv, "gefsjob");
+	TAILQ_INIT(&gd->gd_mq);
+	TAILQ_INIT(&gd->gd_rq);
+	gd->gd_stop = 0;
+	gd->gd_nthreads = 0;
 	error = kthread_create(PRI_NONE, KTHREAD_MPSAFE, NULL, gefs_mutator,
-	    gm, NULL, "gefsmut");
+	    gd, NULL, "gefsmut");
 	if(error)
 		return error;
-	gm->gm_nthreads++;
+	gd->gd_nthreads++;
 	for(i = 0; i < GEFS_NREADERS; i++){
 		if(kthread_create(PRI_NONE, KTHREAD_MPSAFE, NULL, gefs_reader,
-		    gm, NULL, "gefsrd") == 0)
-			gm->gm_nthreads++;
+		    gd, NULL, "gefsrd") == 0)
+			gd->gd_nthreads++;
 	}
 	return 0;
 }
 
 void
-gefs_work_stop(struct gefsmount *gm)
+gefs_work_stop(struct gefsdev *gd)
 {
-	mutex_enter(&gm->gm_jlk);
-	gm->gm_stop = 1;
-	cv_broadcast(&gm->gm_mcv);
-	cv_broadcast(&gm->gm_rcv);
-	while(gm->gm_nthreads > 0)
-		cv_wait(&gm->gm_dcv, &gm->gm_jlk);
-	mutex_exit(&gm->gm_jlk);
-	cv_destroy(&gm->gm_mcv);
-	cv_destroy(&gm->gm_rcv);
-	cv_destroy(&gm->gm_dcv);
-	mutex_destroy(&gm->gm_jlk);
+	mutex_enter(&gd->gd_jlk);
+	gd->gd_stop = 1;
+	cv_broadcast(&gd->gd_mcv);
+	cv_broadcast(&gd->gd_rcv);
+	while(gd->gd_nthreads > 0)
+		cv_wait(&gd->gd_dcv, &gd->gd_jlk);
+	mutex_exit(&gd->gd_jlk);
+	cv_destroy(&gd->gd_mcv);
+	cv_destroy(&gd->gd_rcv);
+	cv_destroy(&gd->gd_dcv);
+	mutex_destroy(&gd->gd_jlk);
 }
 
 /* run fn(gm, arg) on the mutator and wait for it; returns its errno */
 int
 gefs_call(struct gefsmount *gm, void (*fn)(struct gefsmount *, void *), void *arg)
 {
+	struct gefsdev *gd = gm->gm_gd;
 	struct gefsjob j;
 
 	memset(&j, 0, sizeof(j));
+	j.j_gm = gm;
 	j.j_fn = fn;
 	j.j_arg = arg;
 	j.j_wait = 1;
-	mutex_enter(&gm->gm_jlk);
-	TAILQ_INSERT_TAIL(&gm->gm_mq, &j, j_link);
-	cv_signal(&gm->gm_mcv);
+	mutex_enter(&gd->gd_jlk);
+	TAILQ_INSERT_TAIL(&gd->gd_mq, &j, j_link);
+	cv_signal(&gd->gd_mcv);
 	while(!j.j_done)
-		cv_wait(&gm->gm_dcv, &gm->gm_jlk);
-	mutex_exit(&gm->gm_jlk);
+		cv_wait(&gd->gd_dcv, &gd->gd_jlk);
+	mutex_exit(&gd->gd_jlk);
 	return j.j_error;
 }
 
@@ -202,35 +207,39 @@ gefs_call(struct gefsmount *gm, void (*fn)(struct gefsmount *, void *), void *ar
 void
 gefs_post(struct gefsmount *gm, void (*fn)(struct gefsmount *, void *), void *arg)
 {
+	struct gefsdev *gd = gm->gm_gd;
 	struct gefsjob *j;
 
 	j = kmem_zalloc(sizeof(*j), KM_SLEEP);
+	j->j_gm = gm;
 	j->j_fn = fn;
 	j->j_arg = arg;
-	mutex_enter(&gm->gm_jlk);
-	TAILQ_INSERT_TAIL(&gm->gm_mq, j, j_link);
-	cv_signal(&gm->gm_mcv);
-	mutex_exit(&gm->gm_jlk);
+	mutex_enter(&gd->gd_jlk);
+	TAILQ_INSERT_TAIL(&gd->gd_mq, j, j_link);
+	cv_signal(&gd->gd_mcv);
+	mutex_exit(&gd->gd_jlk);
 }
 
 /* page I/O: reads to the readers, writes to the mutator; biodone there */
 void
 gefs_queuebuf(struct gefsmount *gm, struct vnode *vp, struct buf *bp)
 {
+	struct gefsdev *gd = gm->gm_gd;
 	struct gefsjob *j;
 	int rd;
 
 	j = kmem_zalloc(sizeof(*j), KM_SLEEP);
+	j->j_gm = gm;
 	j->j_bp = bp;
 	j->j_vp = vp;
 	rd = (bp->b_flags & B_READ) != 0;
-	mutex_enter(&gm->gm_jlk);
-	if(rd && gm->gm_nthreads > 1){
-		TAILQ_INSERT_TAIL(&gm->gm_rq, j, j_link);
-		cv_signal(&gm->gm_rcv);
+	mutex_enter(&gd->gd_jlk);
+	if(rd && gd->gd_nthreads > 1){
+		TAILQ_INSERT_TAIL(&gd->gd_rq, j, j_link);
+		cv_signal(&gd->gd_rcv);
 	}else{
-		TAILQ_INSERT_TAIL(&gm->gm_mq, j, j_link);
-		cv_signal(&gm->gm_mcv);
+		TAILQ_INSERT_TAIL(&gd->gd_mq, j, j_link);
+		cv_signal(&gd->gd_mcv);
 	}
-	mutex_exit(&gm->gm_jlk);
+	mutex_exit(&gd->gd_jlk);
 }

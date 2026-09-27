@@ -55,6 +55,7 @@ char Eoffset[]	= "read/write -- offset negative";
 char Esnapu[]	= "snap -- is currently mounted";
 char Esnapx[]	= "snap -- already exists";
 char Esnapr[]	= "snap -- reserved name";
+char Enolabel[]	= "snap -- no such label";	/* NetBSD */
 
 char Ewstatb[]	= "wstat -- unknown bits in qid.type/mode";
 char Ewstatd[]	= "wstat -- attempt to change directory";

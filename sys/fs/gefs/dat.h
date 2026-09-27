@@ -198,6 +198,7 @@ extern char Eoffset[];
 extern char Esnapu[];
 extern char Esnapx[];
 extern char Esnapr[];
+extern char Enolabel[];
 
 extern char Ewstatt[];
 extern char Ewstatb[];
@@ -575,6 +576,8 @@ struct Gefs {
 	vlong	nskip;		/* NetBSD: commits skipped, nothing dirty */
 	vlong	lastcommit;	/* NetBSD: nsec() of the last commit */
 	Blk	**blkall;	/* NetBSD: every cache block, to free them */
+	void	*sweepq;	/* NetBSD: deleted trees to sweep after the next commit */
+	Along	broken;		/* NetBSD: it broke; read-only until unmounted */
 	/*
 	 * NetBSD: kernel stacks are 12 KiB, so the snapshot functions'
 	 * key/value buffers live here; they only run with mutlk held.
@@ -717,6 +720,7 @@ struct Cron {
 	vlong	last;
 	char	*tag;
 	char	(*lbl)[128];
+	vlong	chg;	/* NetBSD: the Mount's nchange at the last snapshot */
 };
 
 struct Mount {
@@ -735,6 +739,7 @@ struct Mount {
 
 	/* snapshot scheduling */
 	Cron	cron[3];
+	vlong	nchange;	/* NetBSD: upserts, so unchanged intervals take no snapshot */
 };
 
 struct Conn {

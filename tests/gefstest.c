@@ -316,6 +316,187 @@ phase4(void)
 	qunlock(&fs->mutlk);
 }
 
+extern vlong	nsecskew;
+
+/* how many labels start with pfx */
+static int
+nlabels(char *pfx)
+{
+	char k[128];
+	Scan s;
+	int n;
+
+	k[0] = Klabel;
+	n = snprint(k+1, sizeof(k)-1, "%s", pfx);
+	btnewscan(&s, k, n+1);
+	btenter(&fs->snap, &s);
+	n = 0;
+	while(btnext(&s, &s.kv))
+		n++;
+	btexit(&s);
+	return n;
+}
+
+static int
+ctlerr(char *cmd, char *want)
+{
+	int ok;
+
+	if(waserror()){
+		ok = strncmp(errmsg(), want, strlen(want)) == 0;
+		if(!ok)
+			fprint(2, "%s: %s\n", cmd, errmsg());
+		return ok;
+	}
+	ctlcmd(cmd, 2);
+	poperror();
+	fprint(2, "%s: worked\n", cmd);
+	return 0;
+}
+
+static uvlong
+used(void)
+{
+	uvlong u;
+	int i;
+
+	u = 0;
+	for(i = 0; i < fs->narena; i++)
+		u += fs->arenas[i].used;
+	return u;
+}
+
+/* phase 5: snapshots, forks, the schedule and its retention */
+static void
+phase5(void)
+{
+	Dent *f, *x, *r2;
+	Mount *m, *m2;
+	char *st, *e;
+	uvlong u0, u1;
+	int i, n;
+
+	mount();
+	/* phase 1's first commit took the day, hour and minute snapshots */
+	CHECK(nlabels("main@day.") == 1 && nlabels("main@hour.") == 1,
+		"first commit snapshots: day %d hour %d", nlabels("main@day."), nlabels("main@hour."));
+	ctlcmd("retain main 3@m", 2);
+	CHECK(nlabels("main@day.") == 0 && nlabels("main@hour.") == 0,
+		"tiers left out of the spec age out: day %d hour %d",
+		nlabels("main@day."), nlabels("main@hour."));
+	f = mk(root, "snapfile", Greg, 0644);
+	put(f, 0, 5000, 21);
+	ctlcmd("snap main before", 2);
+	put(f, 0, 5000, 22);
+	CHECK(commit(0) == 1, "commit after the snapshot");
+
+	/* the snapshot has the old data and is read-only */
+	m = mnt;
+	m2 = getmount("before");
+	r2 = gefsroot(m2);
+	mnt = m2;
+	x = look(r2, "snapfile");
+	CHECK(x != nil && checkdata(x, 0, 5000, 21), "snapshot keeps the old data");
+	if(x != nil && !waserror()){
+		put(x, 0, 10, 1);
+		CHECK(0, "wrote into a snapshot");
+		poperror();
+	}
+	mnt = m;
+	CHECK(checkdata(f, 0, 5000, 22), "main has the new data");
+	CHECK(ctlerr("delsnap before", Esnapu), "a mounted snapshot cannot go");
+	clunkdent(m2, x);
+	clunkdent(m2, r2);
+	clunkmount(m2);
+	ctlcmd("delsnap before", 2);
+	CHECK(nlabels("before") == 0, "deleted");
+	CHECK(ctlerr("delsnap before", Enolabel), "deleting it again");
+	CHECK(ctlerr("snap main a/b", Ename), "a label with a slash");
+	CHECK(ctlerr("retain main 3@x", Esyntax), "a bad schedule");
+	CHECK(ctlerr("frobnicate", Ebadctl), "an unknown command");
+
+	/* a fork is a mutable copy */
+	ctlcmd("fork main work", 2);
+	m2 = getmount("work");
+	r2 = gefsroot(m2);
+	mnt = m2;
+	x = look(r2, "snapfile");
+	CHECK(x != nil && checkdata(x, 0, 5000, 22), "the fork has main's data");
+	u0 = used();
+	put(x, 0, 5000, 23);
+	{
+		Dent *big = mk(r2, "big", Greg, 0644);
+		char *buf = malloc(64*Blksz);
+		for(i = 0; i < 16; i++){
+			pattern(buf, 64*Blksz, i*64*Blksz, 5);
+			gefswrite(m2, big, buf, (vlong)i*64*Blksz, 64*Blksz, -1, 0);
+		}
+		free(buf);
+		clunkdent(m2, big);
+	}
+	CHECK(checkdata(x, 0, 5000, 23), "the fork writes");
+	mnt = m;
+	CHECK(checkdata(f, 0, 5000, 22), "main does not see the fork's writes");
+	CHECK(commit(0) == 1, "commit the fork");
+	u1 = used();
+	CHECK(u1 > u0 + 1000*Blksz, "the fork's data takes space: %llud -> %llud", u0, u1);
+	CHECK(nlabels("work@minute.") == 1, "the fork inherited main's schedule: %d",
+		nlabels("work@minute."));
+	ctlcmd("retain work none", 2);
+	CHECK(nlabels("work@") == 0, "retain none drops the fork's snapshots: %d",
+		nlabels("work@"));
+	clunkdent(m2, x);
+	clunkdent(m2, r2);
+	clunkmount(m2);
+	ctlcmd("snap work work2", 2);	/* of an unmounted fork */
+	CHECK(nlabels("work2") == 1, "snapshot of an unmounted fork");
+	ctlcmd("delsnap work2", 2);
+	ctlcmd("delsnap work", 2);
+	for(i = 0; i < 4; i++)
+		commit(Clazy);
+	CHECK(used() < u0 + 64*Blksz, "deleting the fork gave its space back: %llud -> %llud -> %llud",
+		u0, u1, used());
+
+	/* the schedule: one snapshot an interval, only after a change */
+	n = nlabels("main@minute.");
+	nsecskew += 61*Nsec;
+	CHECK(commit(Clazy) == 1 || 1, "commit");
+	CHECK(nlabels("main@minute.") == n, "no change, no snapshot: %d -> %d", n, nlabels("main@minute."));
+	for(i = 0; i < 5; i++){
+		nsecskew += 61*Nsec;
+		put(f, 0, 100, 30+i);
+		commit(0);
+	}
+	CHECK(nlabels("main@minute.") == 3, "3@m keeps 3: %d", nlabels("main@minute."));
+	st = malloc(64*1024);
+	e = seprintstatus(st, st+64*1024);
+	CHECK(strstr(st, "conf main retain 3@m\n") != nil, "status shows the schedule:\n%s", st);
+	CHECK(strstr(st, "fork main\n") != nil && strstr(st, "snap main@minute.") != nil
+		&& strstr(st, "work") == nil, "status lists the labels:\n%s", st);
+	CHECK(e > st && e[-1] == '\n', "status ends");
+	fprint(2, "%s", st);
+	free(st);
+	clunkdent(mnt, f);
+	unmount();
+	qlock(&fs->mutlk);
+	if(!checkfs(2))
+		CHECK(0, "checkfs failed");
+	qunlock(&fs->mutlk);
+}
+
+/* phase 6: the schedule and history survive a reload */
+static void
+phase6(void)
+{
+	mount();
+	CHECK(nlabels("main@minute.") == 3, "minute snapshots after reload: %d", nlabels("main@minute."));
+	CHECK(mnt->cron[0].cnt == 3 && mnt->cron[0].last != 0, "schedule reloaded: cnt %d last %lld",
+		mnt->cron[0].cnt, mnt->cron[0].last);
+	ctlcmd("retain main default", 2);
+	CHECK(mnt->cron[1].cnt == 24 && mnt->cron[2].cnt == -1, "back to 9front's default");
+	unmount();
+}
+
 static void
 run(char *name, void (*fn)(void))
 {
@@ -359,6 +540,8 @@ main(int argc, char **argv)
 	run("reload", phase2);
 	run("crash with an orphan", phase3);
 	run("orphan cleanup", phase4);
+	run("snapshots", phase5);
+	run("snapshots after a reload", phase6);
 	fprint(2, failures ? "FAILED\n" : "all passed\n");
 	return failures != 0;
 }

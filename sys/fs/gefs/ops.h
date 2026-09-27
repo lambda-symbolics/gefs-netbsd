@@ -93,8 +93,20 @@ int	commit(int);
 void	drainsyncq(void);
 void	upsert(Mount*, Msg*, int);
 void	lazyupsert(Mount*, Msg*, int);
+Tree*	snapfs(char*, char*, int, int);
 void	snapcmd(char*, char*, int);
+void	pushsweep(Tree*);
 void	clearblocks(Mount*, vlong, vlong, vlong);
+
+/* snapadm.c */
+void	ctlcmd(char*, int);
+int	ctltokenize(char*, char**, int);
+char*	seprintstatus(char*, char*);
+void	loadautos(Mount*);
+void	autosnaps(void);
+void	autodel(char*);
+char*	seprintsnaptime(char*, char*, vlong);
+int	parsesnaptime(char*, vlong*);
 
 /* ops.c */
 Dent*	getdent(Mount*, vlong, Xdir*);

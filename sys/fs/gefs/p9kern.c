@@ -34,6 +34,9 @@ struct Lwpctx {
 	Errctx	*errp;		/* p9errctxp() returns &errp */
 	Gefs	*fsp;		/* p9fsp() returns &fsp */
 	int	pendfd;		/* the device the next open() returns */
+	char	*cap;		/* fprint's output goes here, see p9capture */
+	int	capsz;
+	int	ncap;
 	Errctx	err;
 };
 
@@ -160,17 +163,50 @@ p9errstr(void)
 	return kerrstr;
 }
 
+/*
+ * Send this LWP's fprint output to buf (the check's findings, for an
+ * ioctl) instead of the console; with buf nil, stop.  Returns the bytes
+ * captured so far.
+ */
+int
+p9capture(char *buf, int n)
+{
+	Lwpctx *c;
+	int r;
+
+	c = lwpctx();
+	r = c->ncap;
+	c->cap = buf;
+	c->capsz = n;
+	c->ncap = 0;
+	if(buf != nil && n > 0)
+		buf[0] = 0;
+	return r;
+}
+
 int
 fprint(int fd, char *fmt, ...)
 {
 	char buf[256];
 	va_list args;
+	Lwpctx *c;
 	int n;
 
 	USED(fd);
 	va_start(args, fmt);
 	n = vsnprint(buf, sizeof(buf), fmt, args);
 	va_end(args);
+	c = lwpctx();
+	if(c->cap != nil){
+		if(c->ncap + n >= c->capsz)
+			n = c->capsz - 1 - c->ncap;
+		if(n > 0){
+			memcpy(c->cap + c->ncap, buf, n);
+			c->ncap += n;
+			c->cap[c->ncap] = 0;
+		}
+		return n;
+	}
 	printf("%s", buf);
 	return n;
 }

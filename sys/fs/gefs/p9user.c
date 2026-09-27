@@ -171,13 +171,15 @@ exits(char *msg)
 	exit(msg != nil && *msg != 0);
 }
 
+vlong	nsecskew;	/* tests move the clock */
+
 vlong
 nsec(void)
 {
 	struct timespec ts;
 
 	clock_gettime(CLOCK_REALTIME, &ts);
-	return (vlong)ts.tv_sec*1000000000LL + ts.tv_nsec;
+	return (vlong)ts.tv_sec*1000000000LL + ts.tv_nsec + nsecskew;
 }
 
 void
