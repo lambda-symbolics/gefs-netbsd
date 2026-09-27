@@ -366,7 +366,15 @@ statupdate(Kvp *kv, Msg *m)
 	assert(m->nv >= 1);
 	p = m->v;
 	op = *p++;
-	kv2dir(kv, &d);
+	/*
+	 * NetBSD: a file with several names keeps its attributes in its
+	 * Khref record, refs[8] then an entry's value; update those.
+	 */
+	if(kv->nk == 9 && kv->k[0] == Kconf+1){
+		memset(&d, 0, sizeof(d));
+		dval2dir(kv->v+8, kv->nv-8, &d);
+	}else
+		kv2dir(kv, &d);
 	/* bump version */
 	d.qid.vers++;
 	if(op & Owsize){
@@ -400,6 +408,12 @@ statupdate(Kvp *kv, Msg *m)
 	}
 	if(p != m->v + m->nv)
 		fatal("malformed stat: kv=%P, m=%M\n", kv, m);
+	if(kv->nk == 9 && kv->k[0] == Kconf+1){
+		e = packdval(kv->v+8, kv->nv-8, &d);
+		if(e == nil || e - kv->v != kv->nv)
+			fatal("repacking link record failed\n");
+		return;
+	}
 	e = packdval(kv->v, kv->nv, &d);
 	/* NetBSD: keep the devt/rdev tail of an entry from Ori's port */
 	if(e != nil && kv->nv == Xdirsz+8){

@@ -144,17 +144,17 @@ phase1(void)
 	gefssetattr(mnt, f, &at, Asize, 1000);
 	CHECK(iszero(f, 12345, 60000-12345), "grown tail is zero (old data must not come back)");
 	/* rename within and across directories, and over a file */
-	gefsrename(mnt, a, f, a, "g", 1, nil);
+	gefsrename(mnt, a, "f", 1, f, a, "g", 1, nil);
 	CHECK((x = look(a, "f")) == nil, "old name gone");
 	clunkdent(mnt, x);
 	CHECK((g = look(a, "g")) == f, "new name");
 	clunkdent(mnt, g);
-	gefsrename(mnt, a, f, b, "g", 1, nil);
+	gefsrename(mnt, a, "g", 1, f, b, "g", 1, nil);
 	CHECK((x = look(a, "g")) == nil, "moved out");
 	clunkdent(mnt, x);
 	h = mk(b, "h", Greg, 0600);
 	put(h, 0, 1000, 9);
-	gefsrename(mnt, b, f, b, "h", 1, h);
+	gefsrename(mnt, b, "g", 1, f, b, "h", 1, h);
 	CHECK((x = look(b, "h")) == f, "rename replaced h");
 	clunkdent(mnt, x);
 	CHECK(h->orphan, "replaced file is an orphan");
@@ -162,7 +162,7 @@ phase1(void)
 	gefsrelease(mnt, h);
 	clunkdent(mnt, h);
 	/* a directory moves with its parent link */
-	gefsrename(mnt, root, b, a, "b2", 2, nil);
+	gefsrename(mnt, root, "b", 1, b, a, "b2", 2, nil);
 	CHECK((x = look(b, "..")) == a, "dotdot follows the move");
 	clunkdent(mnt, x);
 	CHECK(gefsancestor(mnt, a, b), "a is b's ancestor");
@@ -189,6 +189,30 @@ phase1(void)
 	at.perm = 0620;
 	at.rdev = 0x1234;
 	d = gefscreate(mnt, b, "tty", 3, &at, nil, 0);
+	/* hard links: two names, one file */
+	{
+		Dent *hl, *hl2, *x2;
+		Gattr ga;
+
+		hl = mk(b, "hl", Greg, 0644);
+		put(hl, 0, 5000, 11);
+		gefslink(mnt, b, "hl2", 3, hl);
+		CHECK(hl->nlink == 2, "nlink after link %d", hl->nlink);
+		CHECK((hl2 = look(b, "hl2")) == hl, "second name is the same file");
+		clunkdent(mnt, hl2);
+		put(hl, 5000, 1000, 12);	/* through either name: one file */
+		gefsgetattr(hl, &ga);
+		CHECK(ga.size == 6000 && ga.nlink == 2, "linked size %lld nlink %d", ga.size, ga.nlink);
+		gefslink(mnt, root, "hl3", 3, hl);
+		CHECK(hl->nlink == 3, "nlink 3: %d", hl->nlink);
+		gefsremove(mnt, b, "hl", 2, hl);
+		CHECK(!hl->orphan && hl->nlink == 2, "one name removed: orphan %d nlink %d", hl->orphan, hl->nlink);
+		CHECK((x2 = look(b, "hl")) == nil, "removed name gone");
+		clunkdent(mnt, x2);
+		gefsrename(mnt, root, "hl3", 3, hl, a, "hl4", 3, nil);
+		CHECK(checkdata(hl, 0, 5000, 11) && checkdata(hl, 5000, 1000, 12), "linked data");
+		clunkdent(mnt, hl);
+	}
 	/* setuid survives */
 	memset(&at, 0, sizeof(at));
 	at.perm = 04755;
@@ -232,6 +256,22 @@ phase2(void)
 	gefsgetattr(d, &at);
 	CHECK(at.type == Gchr && at.rdev == 0x1234, "device %d rdev %llx", at.type, at.rdev);
 	CHECK(at.perm == 04755, "setuid perm %lo", at.perm);
+	{
+		Dent *h2, *h4;
+		Gattr ga;
+
+		CHECK((h2 = look(b, "hl2")) != nil, "hl2 persisted");
+		CHECK((h4 = look(a, "hl4")) == h2, "hl4 is hl2's file after reload");
+		gefsgetattr(h2, &ga);
+		CHECK(ga.nlink == 2 && ga.size == 6000, "link record nlink %d size %lld", ga.nlink, ga.size);
+		CHECK(checkdata(h2, 0, 5000, 11) && checkdata(h2, 5000, 1000, 12), "linked data after reload");
+		gefsremove(mnt, a, "hl4", 3, h4);
+		gefsremove(mnt, b, "hl2", 3, h2);
+		CHECK(h2->orphan, "last name removed: orphan");
+		gefsrelease(mnt, h2);
+		clunkdent(mnt, h4);
+		clunkdent(mnt, h2);
+	}
 	clunkdent(mnt, a);
 	clunkdent(mnt, b);
 	clunkdent(mnt, g);

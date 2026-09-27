@@ -702,6 +702,9 @@ struct Dent {
 	};
 	/* NetBSD */
 	int	nlink;		/* names: 1, or Khref's count */
+	Key	ak;		/* where attribute updates go: Khref, or the entry */
+	char	akbuf[16];
+	int	xload;		/* loadextra done */
 	int	orphan;		/* removed; data goes at the last release */
 	char	oname[17];	/* its name in the orphanage */
 	void	*vdata;		/* the vnode layer's node */

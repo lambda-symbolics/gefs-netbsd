@@ -126,6 +126,8 @@ gefs_rmjob(struct gefsmount *gm, void *v)
 
 struct mvargs {
 	Dent	*fdir;
+	char	*fname;
+	int	nf;
 	Dent	*de;
 	Dent	*tdir;
 	char	*tname;
@@ -138,7 +140,8 @@ gefs_mvjob(struct gefsmount *gm, void *v)
 {
 	struct mvargs *m = v;
 
-	gefsrename(gm->gm_mnt, m->fdir, m->de, m->tdir, m->tname, m->n, m->tde);
+	gefsrename(gm->gm_mnt, m->fdir, m->fname, m->nf, m->de, m->tdir,
+	    m->tname, m->n, m->tde);
 }
 
 struct saargs {
@@ -154,6 +157,21 @@ gefs_sajob(struct gefsmount *gm, void *v)
 	struct saargs *a = v;
 
 	gefssetattr(gm->gm_mnt, a->de, a->a, a->mask, a->uid);
+}
+
+struct lnargs {
+	Dent	*dir;
+	char	*name;
+	int	n;
+	Dent	*de;
+};
+
+static void
+gefs_lnjob(struct gefsmount *gm, void *v)
+{
+	struct lnargs *l = v;
+
+	gefslink(gm->gm_mnt, l->dir, l->name, l->n, l->de);
 }
 
 /* posted, not waited for: a removed file's data goes in the background */
@@ -763,10 +781,38 @@ static int
 gefs_link(void *v)
 {
 	struct vop_link_v2_args *ap = v;
+	struct vnode *dvp = ap->a_dvp, *vp = ap->a_vp;
+	struct componentname *cnp = ap->a_cnp;
+	struct gefsmount *gm = GMP(dvp);
+	Gattr a;
+	int error;
 
-	/* hard links: doc/DESIGN.org, not done yet */
-	USED(ap);
-	return EOPNOTSUPP;
+	if(vp->v_type == VDIR)
+		return EPERM;
+	if(dvp->v_mount != vp->v_mount)
+		return EXDEV;
+	if((error = vn_lock(vp, LK_EXCLUSIVE)) != 0)
+		return error;
+	gefsgetattr(VTODE(vp), &a);
+	if(a.flags & Gappend){
+		error = EPERM;
+		goto out;
+	}
+	error = kauth_authorize_vnode(cnp->cn_cred, KAUTH_VNODE_ADD_LINK, vp,
+	    dvp, 0);
+	if(error)
+		goto out;
+	{
+		struct lnargs l = { .dir = VTODE(dvp), .name = cnp->cn_nameptr,
+		    .n = cnp->cn_namelen, .de = VTODE(vp) };
+		error = gefs_call(gm, gefs_lnjob, &l);
+	}
+	if(error == 0)
+		cache_enter(dvp, vp, cnp->cn_nameptr, cnp->cn_namelen,
+		    cnp->cn_flags);
+out:
+	VOP_UNLOCK(vp);
+	return error;
 }
 
 /* --- rename, through genfs's rename framework --- */
@@ -888,7 +934,9 @@ gefs_gro_rename(struct mount *mp, kauth_cred_t cred,
 	int error;
 
 	{
-		struct mvargs m = { .fdir = VTODE(fdvp), .de = VTODE(fvp),
+		struct mvargs m = { .fdir = VTODE(fdvp),
+		    .fname = fcnp->cn_nameptr, .nf = fcnp->cn_namelen,
+		    .de = VTODE(fvp),
 		    .tdir = VTODE(tdvp), .tname = tcnp->cn_nameptr,
 		    .n = tcnp->cn_namelen,
 		    .tde = tvp != NULL ? VTODE(tvp) : nil };
@@ -1367,7 +1415,7 @@ gefs_pathconf(void *v)
 
 	switch(ap->a_name){
 	case _PC_LINK_MAX:
-		*ap->a_retval = 1;
+		*ap->a_retval = INT_MAX;
 		return 0;
 	case _PC_NAME_MAX:
 		*ap->a_retval = Maxname;

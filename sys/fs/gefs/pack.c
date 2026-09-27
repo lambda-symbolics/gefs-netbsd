@@ -109,6 +109,34 @@ packdval(char *p, int sz, Xdir *d)
 	return p;
 }
 
+/*
+ * NetBSD: the value half of kv2dir, also used for the attribute record
+ * of a file with several names (Khref: refs[8] then this).
+ */
+void
+dval2dir(char *v, int nv, Xdir *d)
+{
+	char *v0;
+
+	v0 = v;
+	d->flag 	= UNPACK64(v);	v += 8;
+	d->qid.path	= UNPACK64(v);	v += 8;
+	d->qid.vers	= UNPACK32(v);	v += 4;
+	d->qid.type	= UNPACK8(v);	v += 1;
+	d->mode		= UNPACK32(v);	v += 4;
+	d->atime	= UNPACK64(v);	v += 8;
+	d->mtime	= UNPACK64(v);	v += 8;
+	d->length	= UNPACK64(v);	v += 8;
+	d->uid		= UNPACK32(v);	v += 4;
+	d->gid		= UNPACK32(v);	v += 4;
+	d->muid		= UNPACK32(v);	v += 4;
+	if(nv == Xdirsz+8){
+		d->devt	= UNPACK32(v);	v += 4;
+		d->rdev	= UNPACK32(v);	v += 4;
+	}
+	assert(v - v0 == nv);
+}
+
 void
 kv2dir(Kvp *kv, Xdir *d)
 {

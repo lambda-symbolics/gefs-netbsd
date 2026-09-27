@@ -112,6 +112,49 @@ xkey(Key *k, vlong qid, char *name, char *buf, int nbuf)
 	k->nk = 9 + n;
 }
 
+/*
+ * A file with several names (GEFS_FREFCNT) keeps its attributes and link
+ * count in Khref(qid): refs[8], then an entry's value.  Its entries are
+ * copies, so 9front still reads each name as the file.
+ */
+enum {
+	Hrefsz	= 9 + 8 + Xdirsz,	/* key and value of a Khref record */
+};
+
+static void
+hrefkey(Dent *de)
+{
+	de->akbuf[0] = Khref;
+	PACK64(de->akbuf+1, de->qid.path);
+	de->ak.k = de->akbuf;
+	de->ak.nk = 9;
+}
+
+static void
+href2kv(Dent *de, int refs, Msg *m, char *buf)
+{
+	char *p;
+
+	buf[0] = Khref;
+	PACK64(buf+1, de->qid.path);
+	m->k = buf;
+	m->nk = 9;
+	p = buf + 9;
+	PACK64(p, (uvlong)refs);
+	packdval(p+8, Xdirsz, &de->Xdir);
+	m->v = p;
+	m->nv = 8 + Xdirsz;
+}
+
+/* where an attribute update (Owstat) for de goes */
+static Key*
+attrkey(Dent *de)
+{
+	if(de->Xdir.flag & GEFS_FREFCNT)
+		return &de->ak;
+	return &de->Key;
+}
+
 /* the name as a C string, checked the POSIX way */
 static char*
 cname(char *buf, char *name, int n)
@@ -139,10 +182,29 @@ cname(char *buf, char *name, int n)
 static void
 loadextra(Tree *t, Dent *de)
 {
-	char kbuf[Keymax], vbuf[Keymax + 16];
+	char kbuf[Keymax], vbuf[Keymax + 16], hbuf[Hrefsz];
+	char *name;
 	Kvp kv;
 	Key k;
+	Xdir d;
 
+	/* only for a Dent new in memory: an old one may know better */
+	if(de->xload)
+		return;
+	de->xload = 1;
+	if(de->Xdir.flag & GEFS_FREFCNT){
+		hrefkey(de);
+		if(btlookup(t, &de->ak, &kv, hbuf, sizeof(hbuf)) && kv.nv >= 8+Xdirsz){
+			memset(&d, 0, sizeof(d));
+			dval2dir(kv.v+8, kv.nv-8, &d);
+			name = de->name;
+			wlock(de);
+			de->Xdir = d;
+			de->name = name;
+			de->nlink = UNPACK64(kv.v);
+			wunlock(de);
+		}
+	}
 	if((de->Xdir.flag & GEFS_FDEVNOD) && de->devt == 0){
 		xkey(&k, de->qid.path, Xrdev, kbuf, sizeof(kbuf));
 		if(btlookup(t, &k, &kv, vbuf, sizeof(vbuf)) && kv.nv == 12){
@@ -481,8 +543,7 @@ gefssetattr(Mount *mnt, Dent *de, Gattr *a, int mask, int uid)
 		p += 4;
 		buf[0] = op;
 		m.op = Owstat;
-		m.k = de->k;
-		m.nk = de->nk;
+		m.Key = *attrkey(de);
 		m.v = buf;
 		m.nv = p - buf;
 		/* atime alone goes out with the next real commit */
@@ -728,8 +789,7 @@ gefswrite(Mount *mnt, Dent *de, char *s, vlong off, long n, vlong newsize, int u
 		}
 		p = sbuf;
 		kv[i].op = Owstat;
-		kv[i].k = de->k;
-		kv[i].nk = de->nk;
+		kv[i].Key = *attrkey(de);
 		*p++ = 0;
 		if(newsize >= 0 && c == 0){
 			/* the page cache set de->length already */
@@ -823,8 +883,7 @@ gefstrunc(Mount *mnt, Dent *de, vlong len, int uid)
 	PACK64(p, de->mtime);	p += 8;
 	PACK32(p, uid);		p += 4;
 	m[nm].op = Owstat;
-	m[nm].k = de->k;
-	m[nm].nk = de->nk;
+	m[nm].Key = *attrkey(de);
 	m[nm].v = sbuf;
 	m[nm].nv = p - sbuf;
 	nm++;
@@ -1008,8 +1067,8 @@ gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 {
 	struct {
 		char	nbuf[Maxname+1], kbuf[Keymax], kvbuf[Entbuf], upbuf[Upksz];
-		char	tbuf[16], obuf[Kvmax];
-		Msg	mb[4];
+		char	tbuf[16], obuf[Kvmax], hbuf[Hrefsz];
+		Msg	mb[5];
 	} *rb;		/* not on a kernel stack */
 	char *nbuf, *kbuf, *kvbuf, *upbuf, *tbuf, *obuf;
 	Msg *mb;
@@ -1017,8 +1076,9 @@ gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 	Kvp kv;
 	Key k;
 	Xdir d;
-	int nm;
+	int nm, linkrm;
 
+	linkrm = 0;
 	rb = emalloc(sizeof(*rb), 0);
 	if(waserror()){
 		free(rb);
@@ -1065,20 +1125,38 @@ gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 		mb[nm].v = nil;
 		mb[nm].nv = 0;
 		nm++;
+	}else if((de->Xdir.flag & GEFS_FREFCNT) && de->nlink > 1){
+		/* other names remain: one fewer in the record */
+		mb[nm].op = Oinsert;
+		href2kv(de, de->nlink - 1, &mb[nm], rb->hbuf);
+		nm++;
+		linkrm = 1;
 	}else{
+		if(de->Xdir.flag & GEFS_FREFCNT){
+			/* the last name: the record goes, the orphan has it all */
+			mb[nm].op = Odelete;
+			mb[nm].Key = de->ak;
+			mb[nm].v = nil;
+			mb[nm].nv = 0;
+			nm++;
+		}
 		snprint(de->oname, sizeof(de->oname), "%016llux", de->qid.path);
 		d = de->Xdir;
+		d.flag &= ~GEFS_FREFCNT;
 		d.name = de->oname;
 		mb[nm].op = Oinsert;
 		dir2kv(Qorphan, &d, &mb[nm], obuf, Kvmax);
 		nm++;
 	}
 	touch(dir, &mb[nm++], tbuf, nsec());
-	assert(nm <= 4);
+	assert(nm <= 5);
 	upsert(mnt, mb, nm);
 	if(de->mode & DMDIR)
 		de->gone = 1;
+	else if(linkrm)
+		de->nlink--;
 	else{
+		de->Xdir.flag &= ~GEFS_FREFCNT;
 		/* the entry now lives in the orphanage; follow it there */
 		de->orphan = 1;
 		de->nlink = 0;
@@ -1196,28 +1274,29 @@ gefsorphans(Mount *mnt)
  * gefsremove, a directory must be empty.  All of it is one upsert.
  */
 void
-gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Dent *tde)
+gefsrename(Mount *mnt, Dent *fdir, char *fname, int nf, Dent *de, Dent *tdir,
+    char *tname, int n, Dent *tde)
 {
 	struct {
-		char	nbuf[Maxname+1], rnbuf[Kvmax], upbuf[Upksz], tupbuf[Upksz];
-		char	obuf[Kvmax], t1[16], t2[16], okbuf[Keymax];
-		Msg	mb[7];
-	} *nb;		/* 2.7 KiB: not on a kernel stack */
-	char *nbuf, *rnbuf, *upbuf, *tupbuf, *obuf, *t1, *t2, *okbuf;
+		char	nbuf[Maxname+1], fbuf[Maxname+1], rnbuf[Kvmax];
+		char	upbuf[Upksz], tupbuf[Upksz], obuf[Kvmax], t1[16], t2[16];
+		char	okbuf[Keymax], fkbuf[Keymax], hbuf[Hrefsz];
+		Msg	mb[8];
+	} *nb;		/* 3 KiB: not on a kernel stack */
 	Msg *mb;
 	Xdir nd, od;
 	vlong now;
-	Key k;
-	int nm;
+	Key k, fk;
+	int nm, tlinkrm;
 
 	nb = emalloc(sizeof(*nb), 0);
 	if(waserror()){
 		free(nb);
 		nexterror();
 	}
-	nbuf = nb->nbuf; rnbuf = nb->rnbuf; upbuf = nb->upbuf; tupbuf = nb->tupbuf;
-	obuf = nb->obuf; t1 = nb->t1; t2 = nb->t2; okbuf = nb->okbuf; mb = nb->mb;
-	cname(nbuf, tname, n);
+	mb = nb->mb;
+	cname(nb->nbuf, tname, n);
+	cname(nb->fbuf, fname, nf);
 	if(agetl(&fs->rdonly))
 		error(Erdonly);
 	epochstart(0);
@@ -1237,6 +1316,7 @@ gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Den
 		error(Ephase);
 	if(tde == de)
 		goto Done;
+	tlinkrm = 0;
 	if(tde != nil){
 		if(tde->gone || tde->orphan)
 			error(Ephase);
@@ -1250,24 +1330,25 @@ gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Den
 	}
 	now = nsec();
 	nm = 0;
-	/* the old name */
+	/* the old name, which for a linked file need not be de's key */
+	dkey(&fk, fdir->qid.path, nb->fbuf, nb->fkbuf, Keymax);
 	mb[nm].op = Oclobber;
-	mb[nm].Key = de->Key;
+	mb[nm].Key = fk;
 	mb[nm].v = nil;
 	mb[nm].nv = 0;
 	nm++;
 	/* the new one, replacing tde's entry if there is one */
 	nd = de->Xdir;
-	nd.name = nbuf;
+	nd.name = nb->nbuf;
 	nd.qid.vers++;
 	mb[nm].op = Oinsert;
-	dir2kv(tdir->qid.path, &nd, &mb[nm], rnbuf, Kvmax);
+	dir2kv(tdir->qid.path, &nd, &mb[nm], nb->rnbuf, Kvmax);
 	k = mb[nm].Key;
 	nm++;
 	if(de->mode & DMDIR){
-		packsuper(upbuf, Upksz, de->qid.path);
+		packsuper(nb->upbuf, Upksz, de->qid.path);
 		mb[nm].op = Oinsert;
-		mb[nm].k = upbuf;
+		mb[nm].k = nb->upbuf;
 		mb[nm].nk = Upksz;
 		mb[nm].v = k.k;
 		mb[nm].nv = k.nk;
@@ -1275,26 +1356,40 @@ gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Den
 	}
 	if(tde != nil){
 		if(tde->mode & DMDIR){
-			packsuper(tupbuf, Upksz, tde->qid.path);
+			packsuper(nb->tupbuf, Upksz, tde->qid.path);
 			mb[nm].op = Oclobber;
-			mb[nm].k = tupbuf;
+			mb[nm].k = nb->tupbuf;
 			mb[nm].nk = Upksz;
 			mb[nm].v = nil;
 			mb[nm].nv = 0;
 			nm++;
+		}else if((tde->Xdir.flag & GEFS_FREFCNT) && tde->nlink > 1){
+			/* the replaced name was one of several */
+			mb[nm].op = Oinsert;
+			href2kv(tde, tde->nlink - 1, &mb[nm], nb->hbuf);
+			nm++;
+			tlinkrm = 1;
 		}else{
+			if(tde->Xdir.flag & GEFS_FREFCNT){
+				mb[nm].op = Odelete;
+				mb[nm].Key = tde->ak;
+				mb[nm].v = nil;
+				mb[nm].nv = 0;
+				nm++;
+			}
 			snprint(tde->oname, sizeof(tde->oname), "%016llux", tde->qid.path);
 			od = tde->Xdir;
+			od.flag &= ~GEFS_FREFCNT;
 			od.name = tde->oname;
 			mb[nm].op = Oinsert;
-			dir2kv(Qorphan, &od, &mb[nm], obuf, Kvmax);
+			dir2kv(Qorphan, &od, &mb[nm], nb->obuf, Kvmax);
 			nm++;
 		}
 	}
-	touch(fdir, &mb[nm++], t1, now);
+	touch(fdir, &mb[nm++], nb->t1, now);
 	if(tdir != fdir)
-		touch(tdir, &mb[nm++], t2, now);
-	assert(nm <= 7);
+		touch(tdir, &mb[nm++], nb->t2, now);
+	assert(nm <= 8);
 	upsert(mnt, mb, nm);
 
 	/* the entries in memory */
@@ -1305,11 +1400,14 @@ gefsrename(Mount *mnt, Dent *fdir, Dent *de, Dent *tdir, char *tname, int n, Den
 	if(tde != nil){
 		if(tde->mode & DMDIR)
 			tde->gone = 1;
+		else if(tlinkrm)
+			tde->nlink--;
 		else{
+			tde->Xdir.flag &= ~GEFS_FREFCNT;
 			tde->orphan = 1;
 			tde->nlink = 0;
 			tde->up = Qorphan;
-			dkey(&k, Qorphan, tde->oname, okbuf, Keymax);
+			dkey(&k, Qorphan, tde->oname, nb->okbuf, Keymax);
 			cpkey(tde, &k, tde->buf, sizeof(tde->buf));
 			tde->name = tde->buf + 11;
 		}
@@ -1323,6 +1421,98 @@ Done:
 	epochend(0);
 	poperror();
 	free(nb);
+	epochclean();
+}
+
+/*
+ * Give de another name, name in dir.  The first extra name moves the
+ * attributes into a Khref record and marks the entries GEFS_FREFCNT.
+ */
+void
+gefslink(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
+{
+	struct {
+		char	nbuf[Maxname+1], buf[Kvmax], obuf[Kvmax], hbuf[Hrefsz];
+		char	tbuf[16];
+		Msg	mb[4];
+	} *lb;		/* not on a kernel stack */
+	Msg *mb;
+	Dent *e;
+	Tree *t;
+	Xdir d;
+	int nm, refs;
+
+	lb = emalloc(sizeof(*lb), 0);
+	if(waserror()){
+		free(lb);
+		nexterror();
+	}
+	mb = lb->mb;
+	cname(lb->nbuf, name, n);
+	if(agetl(&fs->rdonly))
+		error(Erdonly);
+	epochstart(0);
+	qlock(&fs->mutlk);
+	if(waserror()){
+		qunlock(&fs->mutlk);
+		epochend(0);
+		nexterror();
+	}
+	t = agetp(&mnt->root);
+	if((e = lookup1(mnt, t, dir->qid.path, lb->nbuf)) != nil){
+		clunkdent(mnt, e);
+		error(Eexist);
+	}
+	if(dir->gone || dir->orphan || (dir->mode & DMDIR) == 0)
+		error(Ephase);
+	wlock(de);
+	if(waserror()){
+		wunlock(de);
+		nexterror();
+	}
+	if(de->gone || de->orphan)
+		error(Ephase);
+	if(de->mode & DMDIR)
+		error(Eperm);
+	nm = 0;
+	if(!(de->Xdir.flag & GEFS_FREFCNT)){
+		/* the name it had, marked, with the attributes as they are */
+		de->Xdir.flag |= GEFS_FREFCNT;
+		d = de->Xdir;
+		d.name = de->name;
+		mb[nm].op = Oinsert;
+		dir2kv(de->up, &d, &mb[nm], lb->obuf, Kvmax);
+		nm++;
+		refs = 2;
+	}else
+		refs = de->nlink + 1;
+	mb[nm].op = Oinsert;
+	href2kv(de, refs, &mb[nm], lb->hbuf);
+	nm++;
+	d = de->Xdir;
+	d.name = lb->nbuf;
+	mb[nm].op = Oinsert;
+	dir2kv(dir->qid.path, &d, &mb[nm], lb->buf, Kvmax);
+	nm++;
+	touch(dir, &mb[nm++], lb->tbuf, nsec());
+	assert(nm <= 4);
+	if(waserror()){
+		if(refs == 2)
+			de->Xdir.flag &= ~GEFS_FREFCNT;
+		nexterror();
+	}
+	upsert(mnt, mb, nm);
+	poperror();
+	hrefkey(de);
+	de->nlink = refs;
+	de->xload = 1;
+	poperror();
+	wunlock(de);
+	poperror();
+	qunlock(&fs->mutlk);
+	epochend(0);
+	poperror();
+	free(lb);
 	epochclean();
 }
 

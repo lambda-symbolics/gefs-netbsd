@@ -178,6 +178,7 @@ void	retag2kv(vlong, vlong, int, int, Kvp*, char*, int);
 void	tree2kv(Tree*, Kvp*, char*, int);
 
 void	kv2dir(Kvp*, Xdir*);
+void	dval2dir(char*, int, Xdir*);
 void	kv2dlist(Kvp*, Dlist*);
 void	kv2link(Kvp*, vlong*, vlong*);
 void	kv2qid(Kvp*, Qid*);
