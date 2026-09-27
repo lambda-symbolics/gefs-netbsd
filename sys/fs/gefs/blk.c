@@ -8,6 +8,8 @@
 #include "fns.h"
 
 static vlong	blkalloc_lk(Arena*, int);
+static vlong	blkalloc_lk1(Arena*, int, int);
+enum { Logfloor = 8 };	/* NetBSD: blocks per arena only the allocation log may take */
 static vlong	blkalloc(int, uint, int);
 static void	blkdealloc_lk(Arena*, vlong);
 static Blk*	initblk(Blk*, vlong, vlong, int);
@@ -295,7 +297,7 @@ logappend(Arena *a, vlong off, vlong len, int op)
 	 * and chaining.
 	 */
 	if(lb->logsz >= Logspc - Logslop){
-		o = blkalloc_lk(a, 0);
+		o = blkalloc_lk1(a, 0, 1);	/* NetBSD: recording frees may take the floor */
 		if(o == -1)
 			error(Efull);
 		p = lb->data + lb->logsz;
@@ -511,20 +513,38 @@ logbarrier(Arena *a, vlong gen)
  * per operation, to alloc space for
  * the alloc log.
  */
+/*
+ * NetBSD: the reserve.  Allocations stop at it, except for what frees
+ * space and for commits (resvbegin), which may go down to Logfloor
+ * blocks; those are for the allocation log, which a free appends to.
+ * An arena at its limit, or empty, sends the caller to another arena
+ * (9front could not get here: the reserve kept it from it).
+ */
 static vlong
 blkalloc_lk(Arena *a, int seq)
 {
+	return blkalloc_lk1(a, seq, 0);
+}
+
+static vlong
+blkalloc_lk1(Arena *a, int seq, int forlog)
+{
 	Arange *r;
-	vlong b;
+	vlong b, fr;
 
 	if(seq)
 		r = (Arange*)avlmin(a->free);
 	else
 		r = (Arange*)avlmax(a->free);
-	if(!usereserve && a->size - a->used <= a->reserve)
-		return -1;
+	fr = a->size - a->used;
+	if(!usereserve && !forlog){
+		if(fr <= a->reserve && !agetl(&fs->allowresv))
+			return -1;
+		if(fr <= Logfloor*Blksz)
+			return -1;
+	}
 	if(r == nil)
-		broke(Estuffed);
+		return -1;
 
 	/*
 	 * A bit of sleight of hand here:

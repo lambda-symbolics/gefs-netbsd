@@ -105,6 +105,20 @@ iszero(Dent *de, vlong off, long n)
 	return r == n && i == n;
 }
 
+static int
+checkdata0(Dent *de, vlong off, char *want, long n)
+{
+	char *buf;
+	long r;
+	int ok;
+
+	buf = malloc(n);
+	r = gefsread(mnt, de, buf, off, n);
+	ok = (r == n && memcmp(buf, want, n) == 0);
+	free(buf);
+	return ok;
+}
+
 static void
 put(Dent *de, vlong off, long n, int seed)
 {
@@ -498,6 +512,84 @@ phase6(void)
 }
 
 static void
+showfree(char *what)
+{
+	vlong fr, rs, mn;
+	int i;
+
+	fr = rs = 0;
+	mn = -1;
+	for(i = 0; i < fs->narena; i++){
+		fr += fs->arenas[i].size - fs->arenas[i].used;
+		rs += fs->arenas[i].reserve;
+		if(mn == -1 || fs->arenas[i].size - fs->arenas[i].used < mn)
+			mn = fs->arenas[i].size - fs->arenas[i].used;
+	}
+	fprint(2, "%s: free %lld KiB (least in an arena %lld KiB), reserve %lld KiB\n",
+		what, fr/KiB, mn/KiB, rs/KiB);
+}
+
+/* phase 7: fill the file system, then empty it (rm needs the reserve), and fill it again */
+static void
+phase7(void)
+{
+	Dent *f, *g;
+	char *buf;
+	vlong off, first;
+	int full;
+
+	mount();
+	ctlcmd("retain main none", 2);	/* snapshots would keep what rm frees */
+	buf = malloc(64*Blksz);
+	memset(buf, 0x5a, 64*Blksz);
+	f = mk(root, "fill", Greg, 0644);
+	full = 0;
+	for(off = 0; !full; off += 64*Blksz){
+		if(waserror()){
+			CHECK(strcmp(errmsg(), Efull) == 0, "filling: %s", errmsg());
+			full = 1;
+			continue;
+		}
+		gefswrite(mnt, f, buf, off, 64*Blksz, -1, 0);
+		poperror();
+	}
+	first = off;
+	fprint(2, "full after %lld MiB, %lld KiB left outside the reserve\n",
+		first/MiB, gefsavail(fs)/KiB);
+	CHECK(first > 400*MiB, "a 512 MiB image took only %lld MiB", first/MiB);
+	/* a full file system still removes, commits and syncs */
+	showfree("full");
+	gefsremove(mnt, root, "fill", 4, f);
+	showfree("removed");
+	if(waserror()){
+		showfree("release failed");
+		nexterror();
+	}
+	gefsrelease(mnt, f);
+	poperror();
+	showfree("released");
+	clunkdent(mnt, f);
+	CHECK(commit(0) == 1, "commit when full");
+	showfree("commit 1");
+	commit(Clazy);
+	showfree("commit 2");
+	commit(Clazy);
+	showfree("commit 3");
+	CHECK(gefsavail(fs) > 400*MiB, "space back after rm: %lld MiB", gefsavail(fs)/MiB);
+	g = mk(root, "again", Greg, 0644);
+	for(off = 0; off < first/2; off += 64*Blksz)
+		gefswrite(mnt, g, buf, off, 64*Blksz, -1, 0);
+	CHECK(checkdata0(g, first/2 - 64*Blksz, buf, 64*Blksz), "refilled data");
+	clunkdent(mnt, g);
+	free(buf);
+	unmount();
+	qlock(&fs->mutlk);
+	if(!checkfs(2))
+		CHECK(0, "checkfs failed");
+	qunlock(&fs->mutlk);
+}
+
+static void
 run(char *name, void (*fn)(void))
 {
 	int pid, st;
@@ -542,6 +634,7 @@ main(int argc, char **argv)
 	run("orphan cleanup", phase4);
 	run("snapshots", phase5);
 	run("snapshots after a reload", phase6);
+	run("a full file system", phase7);
 	fprint(2, failures ? "FAILED\n" : "all passed\n");
 	return failures != 0;
 }

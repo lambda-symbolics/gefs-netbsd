@@ -186,6 +186,56 @@ fssync(void)
 static void	sweeps(void);
 
 /*
+ * NetBSD: a full file system.  Allocations stop at the arenas' reserve
+ * (1/1024th, 512 KiB to 8 MiB each), except for what frees space
+ * (removal, truncation, deleting snapshots) and for commits, which the
+ * freeing needs: rm and umount work on a full file system, which on
+ * 9front took "usereserve 1".
+ */
+void
+resvbegin(void)
+{
+	aincl(&fs->allowresv, 1);
+}
+
+void
+resvend(void)
+{
+	aincl(&fs->allowresv, -1);
+}
+
+/* half of the reserve is gone: commit, to get back what was freed */
+int
+lowspace(void)
+{
+	vlong fr, rs;
+	int i;
+
+	fr = rs = 0;
+	for(i = 0; i < fs->narena; i++){
+		fr += fs->arenas[i].size - fs->arenas[i].used;
+		rs += fs->arenas[i].reserve;
+	}
+	return fr < rs/2;
+}
+
+/* bytes a write may still take, outside the reserve (unlocked, a hint) */
+vlong
+gefsavail(Gefs *f)
+{
+	vlong n, fr;
+	int i;
+
+	n = 0;
+	for(i = 0; i < f->narena; i++){
+		fr = f->arenas[i].size - f->arenas[i].used - f->arenas[i].reserve;
+		if(fr > 0)
+			n += fr;
+	}
+	return n;
+}
+
+/*
  * Commit if anything changed since the last commit (or, with Clazy, if
  * lazy updates such as atime are pending).  Returns whether it wrote.
  * From 9front's AOsync, including the allocation log compression.
@@ -216,7 +266,9 @@ commit(int flags)
 		}
 	}
 	oldhd = emalloc(fs->narena*sizeof(Bptr), 1);
+	resvbegin();
 	if(waserror()){
+		resvend();
 		free(oldhd);
 		qunlock(&fs->cmtlk);
 		nexterror();
@@ -229,9 +281,11 @@ commit(int flags)
 		qlock(a);
 		/*
 		 * arbitrary heuristic -- try compressing
-		 * when the log doubles in size.
+		 * when the log doubles in size.  NetBSD: not in an arena that
+		 * is into its reserve; the new log is written before the old
+		 * one is freed.
 		 */
-		if(a->nlog >= 2*a->lastlogsz){
+		if(a->nlog >= 2*a->lastlogsz && a->size - a->used > a->reserve){
 			oldhd[i] = a->loghd;
 			epochstart(0);
 			if(waserror()){
@@ -275,6 +329,7 @@ commit(int flags)
 		aswapl(&fs->lazydirty, 1);
 	sweeps();
 	poperror();
+	resvend();
 	free(oldhd);
 	qunlock(&fs->cmtlk);
 	return 1;
@@ -299,13 +354,16 @@ drainsyncq(void)
 		qunlock(&fs->synclk);
 		fs->snap.dirty = 1;
 		qlock(&fs->cmtlk);
+		resvbegin();
 		if(waserror()){
+			resvend();
 			qunlock(&fs->cmtlk);
 			nexterror();
 		}
 		n = fssync();
 		sweeps();
 		poperror();
+		resvend();
 		qunlock(&fs->cmtlk);
 		if(n && fs->sweepq == nil)
 			break;
@@ -642,11 +700,14 @@ snapcmd(char *old, char *new, int flag)
 	if(agetl(&fs->rdonly))
 		error(Erdonly);
 	qlock(&fs->mutlk);
+	resvbegin();	/* deleting frees; a snapshot takes little */
 	if(waserror()){
+		resvend();
 		qunlock(&fs->mutlk);
 		nexterror();
 	}
 	t = snapfs(old, new, flag, new == nil);
+	resvend();
 	qunlock(&fs->mutlk);
 	poperror();
 
@@ -709,15 +770,26 @@ clearblocks(Mount *mnt, vlong qpath, vlong off, vlong end)
 		mb[nm].nv = 0;
 		if(++nm >= Kvmax/Offksz || off + Blksz >= end){
 			qlock(&fs->mutlk);
+			resvbegin();
 			if(waserror()){
+				resvend();
 				qunlock(&fs->mutlk);
 				nexterror();
 			}
 			upsert(mnt, mb, nm);
+			resvend();
 			qunlock(&fs->mutlk);
 			poperror();
 			epochclean();
 			nm = 0;
+			/*
+			 * The blocks cleared are free after a commit; a big
+			 * removal on a nearly full file system commits on the
+			 * way rather than run out.
+			 */
+			if(lowspace()){
+				commit(0);
+			}
 		}
 	}
 	poperror();

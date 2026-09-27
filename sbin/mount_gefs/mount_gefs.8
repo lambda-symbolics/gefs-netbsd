@@ -1,0 +1,89 @@
+.\"	$NetBSD$
+.\"
+.\" Copyright (c) 2026 Lukas Hozda.
+.\" Permission is hereby granted, free of charge, to any person obtaining a
+.\" copy of this documentation, to deal in it without restriction, subject to
+.\" the MIT licence of the gefs port.
+.\"
+.Dd September 28, 2026
+.Dt MOUNT_GEFS 8
+.Os
+.Sh NAME
+.Nm mount_gefs
+.Nd mount a gefs file system, or one of its snapshots
+.Sh SYNOPSIS
+.Nm
+.Op Fl o Ar options
+.Ar special node
+.Sh DESCRIPTION
+.Nm
+attaches a label of the gefs file system on the block device
+.Ar special
+to the directory
+.Ar node .
+A gefs file system holds several trees, each named by a label:
+.Dq main
+by default, forks (mutable copies) and snapshots (read-only).
+The labels of one device may be mounted at the same time on different
+nodes; they share one block cache and one set of kernel threads, and each
+mount has its own device number, so files that a fork shares with its
+base are not taken for hard links of each other.
+A label is mounted at most once.
+.Pp
+The options are those of
+.Xr mount 8
+.Pq Cm ro , rw , update , noatime , nodev , nosuid , noexec , sync , async , force
+and:
+.Bl -tag -width indent
+.It Cm snap= Ns Ar label
+Mount
+.Ar label
+instead of
+.Dq main .
+A snapshot may only be mounted read-only.
+The label
+.Dq dump
+(9front's view of all the snapshots) is not supported; mount the
+snapshots themselves.
+.It Cm cache= Ns Ar MiB
+The size of the block cache, when this mount is the first of its device
+(default 64).
+.El
+.Pp
+Access times are updated at most once a day unless the file changed
+since
+.Pq Dq relatime ,
+and reach the disk with the next commit that happens anyway.
+.Sh POWER
+gefs writes nothing while nothing changes: the syncer's periodic call
+commits only when there are changes, file data goes into the tree when
+its pages are written back, and one commit (two device cache flushes)
+takes all of it.
+An idle mount does no disk I/O at all; automatic snapshots are taken by
+such commits and only for labels that changed.
+.Sh EXAMPLES
+Mount the file system, a fork of it for build output, and yesterday's
+snapshot:
+.Bd -literal -offset indent
+mount -t gefs /dev/dk1 /
+mount -t gefs -o snap=obj /dev/dk1 /usr/obj
+mount -t gefs -o ro,snap=main@day.2026.09.27_00:00:00 /dev/dk1 /mnt
+.Ed
+.Pp
+The
+.Xr fstab 5
+entries:
+.Bd -literal -offset indent
+NAME=gefsroot	/		gefs	rw		0 0
+NAME=gefsroot	/usr/obj	gefs	rw,snap=obj	0 0
+.Ed
+.Sh SEE ALSO
+.Xr mount 2 ,
+.Xr fstab 5 ,
+.Xr gefs 8 ,
+.Xr mount 8
+.Sh HISTORY
+gefs was written by Ori Bernstein for 9front.
+The
+.Nx
+port appeared in 2026.

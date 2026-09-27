@@ -51,6 +51,9 @@ struct gefs_ctl {
 #include <sys/queue.h>
 
 #define GEFS_NREADERS	2
+#define GEFS_WBEHIND	(1024*1024)	/* write-behind window */
+#define GEFS_MAXWQ	64		/* page writes queued: 4 MiB of pager VA */
+#define GEFS_WMARGIN	(64*1024*1024)	/* write(2) says ENOSPC this much early */
 
 struct gefsjob;
 struct gefsmount;
@@ -81,6 +84,9 @@ struct gefsdev {
 	struct gefsjobq	gd_rq;
 	int		gd_nthreads;
 	int		gd_stop;
+	int		gd_nwq;		/* page writes queued or running */
+	kcondvar_t	gd_wqcv;	/* room in the write queue */
+	struct lwp	*gd_mutlwp;	/* the mutator */
 	volatile int	gd_lazyq;	/* a lazy commit is queued */
 };
 
@@ -106,6 +112,7 @@ struct gefsnode {
 	struct Scan	*gn_scan;	/* where the last readdir stopped */
 	off_t		gn_scanoff;
 	volatile int	gn_atimeq;	/* an atime update is queued */
+	volatile int	gn_werror;	/* a page write failed: for write, fsync, close */
 };
 
 #define VFSTOGEFS(mp)	((struct gefsmount *)(mp)->mnt_data)

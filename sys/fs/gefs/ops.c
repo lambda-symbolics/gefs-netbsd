@@ -833,8 +833,8 @@ gefswrite(Mount *mnt, Dent *de, char *s, vlong off, long n, vlong newsize, int u
  * the unaligned new length, which match no key: the blocks after it
  * stayed, and came back when the file grew.)
  */
-void
-gefstrunc(Mount *mnt, Dent *de, vlong len, int uid)
+static void
+gefstrunc1(Mount *mnt, Dent *de, vlong len, int uid)
 {
 	char sbuf[Wstatmax], kbuf[Offksz], vbuf[Ptrsz], *p, *zero;
 	vlong old, tail;
@@ -1062,8 +1062,8 @@ gefscreate(Mount *mnt, Dent *dir, char *name, int n, Gattr *a, char *link, int n
  * when the last user is done, and a mount after a crash frees whatever
  * is still there.
  */
-void
-gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
+static void
+gefsremove1(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 {
 	struct {
 		char	nbuf[Maxname+1], kbuf[Keymax], kvbuf[Entbuf], upbuf[Upksz];
@@ -1175,8 +1175,8 @@ gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
 }
 
 /* the last reference to a removed file is gone: free its data */
-void
-gefsrelease(Mount *mnt, Dent *de)
+static void
+gefsrelease1(Mount *mnt, Dent *de)
 {
 	char kbuf[Keymax], xkbuf[Keymax];
 	Msg mb[2];
@@ -1215,8 +1215,8 @@ gefsrelease(Mount *mnt, Dent *de)
 }
 
 /* at mount: finish removals that a crash interrupted */
-void
-gefsorphans(Mount *mnt)
+static void
+gefsorphans1(Mount *mnt)
 {
 	char pfx[Dpfxsz];
 	Dent *de;
@@ -1273,8 +1273,8 @@ gefsorphans(Mount *mnt)
  * is tde, and is replaced: a file goes to the orphanage as in
  * gefsremove, a directory must be empty.  All of it is one upsert.
  */
-void
-gefsrename(Mount *mnt, Dent *fdir, char *fname, int nf, Dent *de, Dent *tdir,
+static void
+gefsrename1(Mount *mnt, Dent *fdir, char *fname, int nf, Dent *de, Dent *tdir,
     char *tname, int n, Dent *tde)
 {
 	struct {
@@ -1575,6 +1575,52 @@ gefsreaddir(Mount *mnt, Dent *dir, Scan *s, int (*fn)(void*, Xdir*), void *arg)
 }
 
 /* --- errors --- */
+
+/*
+ * NetBSD: what frees space may take blocks from the reserve on the way,
+ * so a full file system can be emptied (see resvbegin).
+ */
+#define RESVWRAP(call) do{			\
+	resvbegin();				\
+	if(waserror()){				\
+		resvend();			\
+		nexterror();			\
+	}					\
+	call;					\
+	poperror();				\
+	resvend();				\
+}while(0)
+
+void
+gefstrunc(Mount *mnt, Dent *de, vlong len, int uid)
+{
+	RESVWRAP(gefstrunc1(mnt, de, len, uid));
+}
+
+void
+gefsremove(Mount *mnt, Dent *dir, char *name, int n, Dent *de)
+{
+	RESVWRAP(gefsremove1(mnt, dir, name, n, de));
+}
+
+void
+gefsrelease(Mount *mnt, Dent *de)
+{
+	RESVWRAP(gefsrelease1(mnt, de));
+}
+
+void
+gefsorphans(Mount *mnt)
+{
+	RESVWRAP(gefsorphans1(mnt));
+}
+
+void
+gefsrename(Mount *mnt, Dent *fdir, char *fname, int nf, Dent *de, Dent *tdir,
+    char *tname, int nt, Dent *tde)
+{
+	RESVWRAP(gefsrename1(mnt, fdir, fname, nf, de, tdir, tname, nt, tde));
+}
 
 static struct {
 	char	*msg;

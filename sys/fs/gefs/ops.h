@@ -98,6 +98,12 @@ void	snapcmd(char*, char*, int);
 void	pushsweep(Tree*);
 void	clearblocks(Mount*, vlong, vlong, vlong);
 
+/* NetBSD: freeing and committing may use the reserve (a full fs can be emptied) */
+void	resvbegin(void);
+void	resvend(void);
+int	lowspace(void);
+vlong	gefsavail(Gefs*);
+
 /* snapadm.c */
 void	ctlcmd(char*, int);
 int	ctltokenize(char*, char**, int);

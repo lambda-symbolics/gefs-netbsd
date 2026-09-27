@@ -1,0 +1,239 @@
+.\"	$NetBSD$
+.\"
+.\" Copyright (c) 2026 Lukas Hozda.
+.\" Permission is hereby granted, free of charge, to any person obtaining a
+.\" copy of this documentation, to deal in it without restriction, subject to
+.\" the MIT licence of the gefs port.
+.\"
+.Dd September 28, 2026
+.Dt GEFS 8
+.Os
+.Sh NAME
+.Nm gefs ,
+.Nm newfs_gefs ,
+.Nm fsck_gefs
+.Nd make, check and administer gefs file systems
+.Sh SYNOPSIS
+.Nm newfs_gefs
+.Op Fl 9
+.Op Fl r Ar spec
+.Op Fl u Ar user
+.Ar special
+.Nm fsck_gefs
+.Op Fl fpy
+.Ar special
+.Nm
+.Cm status
+.Ar path | special
+.Nm
+.Cm snap
+.Op Fl m
+.Ar path | special
+.Ar label new
+.Nm
+.Cm fork
+.Ar path | special
+.Ar label new
+.Nm
+.Cm delsnap
+.Ar path | special
+.Ar label
+.Nm
+.Cm retain
+.Ar path | special
+.Ar label | Cm \-
+.Ar spec ...
+.Nm
+.Cm sync
+.Ar path
+.Nm
+.Cm check
+.Ar path | special
+.Nm
+.Cm ctl
+.Ar path | special
+.Ar command ...
+.Sh DESCRIPTION
+gefs is the copy-on-write file system of 9front
+.Pq Xr gefs 4 there ,
+a B-epsilon tree whose snapshots are free to take and cost only the
+space of what changed since.
+A gefs file system is a set of trees, each named by a label.
+.Dq main
+is the one mounted by default;
+.Dq empty
+is the empty tree every other is forked from, and
+.Dq adm
+holds 9front's user table, which
+.Nx
+does not use.
+A
+.Em fork
+is a mutable label; a
+.Em snapshot
+is a read-only one.
+Any label may be mounted
+.Pq Xr mount_gefs 8 ,
+several at once.
+.Pp
+The administration commands work on a mounted file system, given any
+.Ar path
+on it, through an
+.Xr ioctl 2 ;
+or on a
+.Ar special
+device or image file that is not mounted, which
+.Nm
+then loads and writes itself.
+They are the commands of 9front's
+.Pa /adm/ctl :
+.Bl -tag -width indent
+.It Cm status
+Print the space used, the retention settings, and the labels, each as
+.Dq fork
+or
+.Dq snap .
+.It Cm snap Oo Fl m Oc Ar label new
+Take a snapshot of
+.Ar label
+named
+.Ar new ;
+with
+.Fl m ,
+or as
+.Cm fork ,
+a mutable one.
+For a mounted label, the files' dirty pages go into the snapshot.
+.It Cm delsnap Ar label
+Delete a label, freeing the blocks nothing else holds.
+A mounted label cannot be deleted.
+Deleting a fork leaves the snapshots taken of it.
+.It Cm retain Ar label spec ...
+Set the automatic snapshots of
+.Ar label ,
+or with
+.Cm \-
+the default for the labels that set none.
+A
+.Ar spec
+is a list of
+.Ar count Ns Li @ Ns Ar interval Ns Ar unit ,
+the unit
+.Li m ,
+.Li h
+or
+.Li d :
+.Dq 60@m 24@h 14@d
+keeps a snapshot for each of the last 60 minutes, 24 hours and 14 days.
+Without a count, snapshots are kept forever; without an interval, it is
+1.
+.Cm none
+takes no automatic snapshots (and removes the label's existing ones);
+.Cm default
+clears the label's own setting.
+A fork inherits the setting of the label it was forked from.
+.It Cm sync
+Commit everything now.
+.It Cm check
+Check the whole file system.
+.It Cm ctl Ar command
+Run any of the above, as a command line of 9front's
+.Pa /adm/ctl ,
+and
+.Cm usereserve 1 ,
+which lets deletions use the space kept in reserve when the file system
+is full.
+.El
+.Pp
+Automatic snapshots are named
+.Ar label Ns Li @ Ns Ar tier Ns Li \&. Ns Ar YYYY.MM.DD_hh:mm:ss ,
+in UTC, the tier
+.Li minute ,
+.Li hour
+or
+.Li day .
+Unlike 9front, which takes one each interval, a snapshot is taken by a
+commit that writes anyway, and only when the label changed since that
+tier's last one: an idle file system does no I/O, and the snapshots
+kept are states that differ.
+.Pp
+.Nm newfs_gefs
+creates a file system on
+.Ar special :
+a root directory owned by root, and the default retention
+.Dq 60@m 24@h 14@d
+.Pq Fl r Ar spec No to choose another, Fl r Cm none No for none .
+With
+.Fl 9 ,
+the file system is made as 9front's
+.Nm gefs Fl r
+makes it (a root owned by adm, no retention setting, so 9front's default
+.Dq 60@m 24@h @d ,
+which keeps a daily snapshot forever);
+.Fl u
+names the user 9front's user table gets.
+.Pp
+.Nm fsck_gefs
+checks the trees, the free lists and the deadlists.
+gefs needs no repair after a crash: a mount finds the last commit.
+The options of
+.Xr fsck 8
+are accepted and ignored.
+.Sh BOOTING
+The
+.Nx
+EFI boot loader reads gefs: it loads
+.Pa boot.cfg ,
+the kernel and modules from the GPT partition marked
+.Dq bootme
+.Pq Xr gpt 8 ,
+and a path starting with
+.Li @ Ns Ar label
+is read from that label, say an automatic snapshot, to boot yesterday's
+kernel:
+.Bd -literal -offset indent
+boot @main@day.2026.09.27_00:00:00/netbsd
+.Ed
+.Pp
+A kernel with gefs built in finds its root from the boot loader and
+mounts
+.Dq main .
+.Sh EXAMPLES
+Make a gefs root partition that the EFI loader boots from:
+.Bd -literal -offset indent
+gpt add -a 1m -t 38417555-670b-4a70-8e7a-bd7ce366f5a1 -l gefsroot wd0
+gpt set -a bootme -i 2 wd0
+newfs_gefs /dev/rdk1
+.Ed
+.Pp
+Keep build output out of the snapshots of
+.Dq main :
+.Bd -literal -offset indent
+gefs fork / empty obj
+gefs retain / obj none
+mount -t gefs -o snap=obj /dev/dk1 /usr/obj
+.Ed
+.Pp
+Take a snapshot before an upgrade, and look at it:
+.Bd -literal -offset indent
+gefs snap / main pre-upgrade
+mount -t gefs -o ro,snap=pre-upgrade /dev/dk1 /mnt
+.Ed
+.Sh SEE ALSO
+.Xr fstab 5 ,
+.Xr gpt 8 ,
+.Xr mount_gefs 8
+.Rs
+.%A Ori Bernstein
+.%T GEFS, a good enough file system
+.Re
+.Sh HISTORY
+gefs was written by Ori Bernstein for 9front.
+The
+.Nx
+port appeared in 2026.
+.Sh BUGS
+There is no index from inode numbers to files, so gefs file systems
+cannot be exported over NFS.
+Change times are the modification times.
+Extended attributes are not supported.

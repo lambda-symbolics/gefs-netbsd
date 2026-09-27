@@ -21,6 +21,7 @@
 #include <sys/vnode.h>
 #include <sys/buf.h>
 #include <sys/queue.h>
+#include <uvm/uvm.h>
 
 #include <u.h>
 #include <libc.h>
@@ -63,8 +64,23 @@ gefs_bufio(struct gefsmount *gm, struct vnode *vp, struct buf *bp)
 		size = vp->v_size;
 		if(off < size){
 			n = MIN(len, size - off);
-			gefswrite(gm->gm_mnt, de, bp->b_data, off, n, size,
-			    de->muid);
+			if(!waserror()){
+				gefswrite(gm->gm_mnt, de, bp->b_data, off, n,
+				    size, de->muid);
+				poperror();
+			}else{
+				/*
+				 * Full: what was freed since the last commit
+				 * (rm -rf, then make) is not free until the
+				 * next one.  Commit, and try once more.
+				 */
+				if(strcmp(errmsg(), Efull) != 0)
+					nexterror();
+				commit(Clazy);
+				commit(Clazy);
+				gefswrite(gm->gm_mnt, de, bp->b_data, off, n,
+				    size, de->muid);
+			}
 		}
 	}
 }
@@ -88,6 +104,15 @@ gefs_runjob(struct gefsdev *gd, struct gefsjob *j)
 	}
 	p9setfs(nil);
 	if((bp = j->j_bp) != NULL){
+		/* the data is gone; the next write, fsync or close says so */
+		if(error != 0 && !(bp->b_flags & B_READ) && VTOGN(j->j_vp) != NULL)
+			VTOGN(j->j_vp)->gn_werror = error;
+		if(!(bp->b_flags & B_READ)){
+			mutex_enter(&gd->gd_jlk);
+			if(gd->gd_nwq-- == GEFS_MAXWQ)
+				cv_broadcast(&gd->gd_wqcv);
+			mutex_exit(&gd->gd_jlk);
+		}
 		kmem_free(j, sizeof(*j));
 		bp->b_error = error;
 		bp->b_resid = 0;
@@ -129,6 +154,7 @@ gefs_mutator(void *arg)
 {
 	struct gefsdev *gd = arg;
 
+	gd->gd_mutlwp = curlwp;
 	gefs_thread(gd, &gd->gd_mq, &gd->gd_mcv);
 }
 
@@ -149,6 +175,8 @@ gefs_work_start(struct gefsdev *gd)
 	cv_init(&gd->gd_mcv, "gefsmut");
 	cv_init(&gd->gd_rcv, "gefsrd");
 	cv_init(&gd->gd_dcv, "gefsjob");
+	cv_init(&gd->gd_wqcv, "gefswq");
+	gd->gd_nwq = 0;
 	TAILQ_INIT(&gd->gd_mq);
 	TAILQ_INIT(&gd->gd_rq);
 	gd->gd_stop = 0;
@@ -179,6 +207,7 @@ gefs_work_stop(struct gefsdev *gd)
 	cv_destroy(&gd->gd_mcv);
 	cv_destroy(&gd->gd_rcv);
 	cv_destroy(&gd->gd_dcv);
+	cv_destroy(&gd->gd_wqcv);
 	mutex_destroy(&gd->gd_jlk);
 }
 
@@ -220,20 +249,40 @@ gefs_post(struct gefsmount *gm, void (*fn)(struct gefsmount *, void *), void *ar
 	mutex_exit(&gd->gd_jlk);
 }
 
-/* page I/O: reads to the readers, writes to the mutator; biodone there */
+/*
+ * Page I/O: reads to the readers, writes to the mutator; biodone there.
+ * Queued writes hold pager VA and dirty pages, so there are at most
+ * GEFS_MAXWQ: writers wait for room.  The pagedaemon never waits here,
+ * nor allocates what it cannot get at once: it gets ENOMEM, which UVM
+ * takes as "try this page again later" and redirties it.
+ */
 void
 gefs_queuebuf(struct gefsmount *gm, struct vnode *vp, struct buf *bp)
 {
 	struct gefsdev *gd = gm->gm_gd;
 	struct gefsjob *j;
-	int rd;
+	int rd, pd;
 
-	j = kmem_zalloc(sizeof(*j), KM_SLEEP);
+	rd = (bp->b_flags & B_READ) != 0;
+	pd = (curlwp == uvm.pagedaemon_lwp);
+	j = kmem_zalloc(sizeof(*j), pd ? KM_NOSLEEP : KM_SLEEP);
+	if(j == NULL)
+		goto nomem;
 	j->j_gm = gm;
 	j->j_bp = bp;
 	j->j_vp = vp;
-	rd = (bp->b_flags & B_READ) != 0;
 	mutex_enter(&gd->gd_jlk);
+	if(!rd){
+		if(pd && gd->gd_nwq >= GEFS_MAXWQ){
+			mutex_exit(&gd->gd_jlk);
+			kmem_free(j, sizeof(*j));
+			goto nomem;
+		}
+		/* the mutator itself (never), and the pagedaemon, do not wait */
+		while(!pd && curlwp != gd->gd_mutlwp && gd->gd_nwq >= GEFS_MAXWQ)
+			cv_wait(&gd->gd_wqcv, &gd->gd_jlk);
+		gd->gd_nwq++;
+	}
 	if(rd && gd->gd_nthreads > 1){
 		TAILQ_INSERT_TAIL(&gd->gd_rq, j, j_link);
 		cv_signal(&gd->gd_rcv);
@@ -242,4 +291,9 @@ gefs_queuebuf(struct gefsmount *gm, struct vnode *vp, struct buf *bp)
 		cv_signal(&gd->gd_mcv);
 	}
 	mutex_exit(&gd->gd_jlk);
+	return;
+nomem:
+	bp->b_error = ENOMEM;
+	bp->b_resid = bp->b_bcount;
+	biodone(bp);
 }

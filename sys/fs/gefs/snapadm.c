@@ -350,7 +350,9 @@ static int
 autotake(char *label, char *name)
 {
 	if(waserror()){
-		fprint(2, "gefs: snapshot %s: %s\n", name, errmsg());
+		/* taken already: the clock went back */
+		if(strcmp(errmsg(), Esnapx) != 0)
+			fprint(2, "gefs: snapshot %s: %s\n", name, errmsg());
 		return 0;
 	}
 	snapfs(label, name, 0, 0);
@@ -553,8 +555,24 @@ setretain(char *label, char **spec, int nspec)
  * The check's findings go to fd.  For snap and fork of a mounted label,
  * the caller first puts the label's dirty pages into its tree.
  */
+static void	ctlcmd1(char*, int);
+
+/* administration may use the reserve: it is how a full file system is emptied */
 void
 ctlcmd(char *cmd, int fd)
+{
+	resvbegin();
+	if(waserror()){
+		resvend();
+		nexterror();
+	}
+	ctlcmd1(cmd, fd);
+	poperror();
+	resvend();
+}
+
+static void
+ctlcmd1(char *cmd, int fd)
 {
 	char buf[256], *sp[16];
 	vlong v;

@@ -443,10 +443,29 @@ gefs_open(void *v)
 	return 0;
 }
 
+/* a page write that failed since the last report (ENOSPC, EIO) */
+static int
+gefs_werror(struct vnode *vp)
+{
+	struct gefsnode *gn = VTOGN(vp);
+	int e;
+
+	if(gn == NULL || (e = gn->gn_werror) == 0)
+		return 0;
+	gn->gn_werror = 0;
+	return e;
+}
+
 static int
 gefs_close(void *v)
 {
-	return 0;
+	struct vop_close_args /* {
+		struct vnode *a_vp;
+		int a_fflag;
+		kauth_cred_t a_cred;
+	} */ *ap = v;
+
+	return (ap->a_fflag & FWRITE) ? gefs_werror(ap->a_vp) : 0;
 }
 
 static int
@@ -690,6 +709,20 @@ gefs_write(void *v)
 		return EINVAL;
 	if(uio->uio_resid == 0)
 		return 0;
+	if((error = gefs_werror(vp)) != 0)
+		return error;
+	/*
+	 * File data takes its blocks when its pages are put, after write(2)
+	 * returned; say ENOSPC here, with a margin for what is in flight,
+	 * rather than lose data then.  What was freed since the last commit
+	 * is free after one.
+	 */
+	if(gefsavail(gm->gm_fs) < uio->uio_resid + GEFS_WMARGIN){
+		(void)gefs_commit(gm, 1, Clazy);
+		(void)gefs_commit(gm, 1, Clazy);
+		if(gefsavail(gm->gm_fs) < uio->uio_resid + GEFS_WMARGIN)
+			return ENOSPC;
+	}
 	osize = vp->v_size;
 	if(ioflag & IO_APPEND)
 		uio->uio_offset = osize;
@@ -707,9 +740,26 @@ gefs_write(void *v)
 	}
 	error = 0;
 	while(error == 0 && uio->uio_resid > 0){
-		len = uio->uio_resid;
+		off_t oldoff = uio->uio_offset;
+
+		len = MIN(uio->uio_resid, GEFS_WBEHIND);
 		error = ubc_uiomove(&vp->v_uobj, uio, len, IO_ADV_DECODE(ioflag),
 		    UBC_WRITE | UBC_VNODE_FLAGS(vp));
+		/*
+		 * Write-behind, as FFS: whole windows this write filled go
+		 * into the tree now (not to the disk: that is the commit's),
+		 * so a big write does not fill memory with dirty pages that
+		 * only the mutator can clean.  Small files and appends stay
+		 * in memory until the syncer.
+		 */
+		if(error == 0 && oldoff / GEFS_WBEHIND !=
+		    uio->uio_offset / GEFS_WBEHIND){
+			rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
+			error = VOP_PUTPAGES(vp,
+			    rounddown(oldoff, GEFS_WBEHIND),
+			    rounddown(uio->uio_offset, GEFS_WBEHIND),
+			    PGO_CLEANIT);
+		}
 	}
 	if(error){
 		uvm_vnp_setsize(vp, osize);
@@ -748,6 +798,8 @@ gefs_fsync(void *v)
 		rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
 		error = VOP_PUTPAGES(vp, 0, 0, PGO_ALLPAGES | PGO_CLEANIT |
 		    ((ap->a_flags & FSYNC_WAIT) ? PGO_SYNCIO : 0));
+		if(error == 0)
+			error = gefs_werror(vp);
 		if(error)
 			return error;
 	}

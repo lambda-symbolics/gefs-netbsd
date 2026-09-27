@@ -578,6 +578,7 @@ struct Gefs {
 	Blk	**blkall;	/* NetBSD: every cache block, to free them */
 	void	*sweepq;	/* NetBSD: deleted trees to sweep after the next commit */
 	Along	broken;		/* NetBSD: it broke; read-only until unmounted */
+	Along	allowresv;	/* NetBSD: freeing, and commits, may use the reserve */
 	/*
 	 * NetBSD: kernel stacks are 12 KiB, so the snapshot functions'
 	 * key/value buffers live here; they only run with mutlk held.
