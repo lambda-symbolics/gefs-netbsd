@@ -15,7 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "../../sys/fs/gefs/gefs.h"
+#include <fs/gefs/gefs.h>
 
 static const struct {
 	const char	*name;

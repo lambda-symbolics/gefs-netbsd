@@ -1,0 +1,30 @@
+Changes to NetBSD's own files, against netbsd-11-0-RELEASE (src/).
+The gefs sources themselves are new files: copy sys/fs/gefs,
+sys/modules/gefs, sys/lib/libsa/gefs.[ch], sbin/gefs and sbin/mount_gefs
+of this repository into the tree.
+
+netbsd-11-tree.diff	gefs in sys/conf/files (file-system GEFS in a kernel
+			config), the module and the header in their SUBDIRs
+netbsd-11-efiboot.diff	libsa builds gefs.c; efiboot tries gefs after the
+			other file systems (SUPPORT_GEFS)
+
+Not made as diffs here (the VM holds only sys/ and common/), for a full
+build.sh build:
+
+  sbin/Makefile			SUBDIR+= gefs mount_gefs
+  distrib/sets/lists/base/mi	./sbin/fsck_gefs  base-sysutil-root
+				./sbin/gefs  base-sysutil-root
+				./sbin/mount_gefs  base-sysutil-root
+				./sbin/newfs_gefs  base-sysutil-root
+  distrib/sets/lists/comp/mi	./usr/include/fs/gefs  comp-c-include
+				./usr/include/fs/gefs/gefs.h  comp-c-include
+  distrib/sets/lists/man/mi	./usr/share/man/cat8/{gefs,newfs_gefs,
+				fsck_gefs,mount_gefs}.0 and the man8 and
+				html8 counterparts, man-sysutil-man
+  distrib/sets/lists/modules/mi	./@MODULEDIR@/gefs  modules-base-kernel
+				./@MODULEDIR@/gefs/gefs.kmod  modules-base-kernel
+  etc/mtree/NetBSD.dist.base	./usr/include/fs/gefs
+  sbin/gpt/gpt.c (gpt_uuid.c)	a "gefs" partition type:
+				38417555-670b-4a70-8e7a-bd7ce366f5a1 (proposed)
+  sys/dev/dkwedge/dkwedge_gpt.c	the same type as ptype "gefs", so mount(8)
+				without -t finds gefs on a wedge

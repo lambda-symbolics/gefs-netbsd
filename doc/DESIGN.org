@@ -59,7 +59,7 @@ the commit protocol.
 | sys/modules/gefs           | the kernel module                               |
 | sys/lib/libsa/gefs.[ch]    | read-only gefs for the boot loaders             |
 | sbin/mount_gefs            | mount helper and mount_gefs(8)                  |
-| usr.sbin/gefs              | gefs(8): newfs_gefs, fsck_gefs, administration  |
+| sbin/gefs                  | gefs(8): newfs_gefs, fsck_gefs, administration  |
 | patches/                   | changes to NetBSD's own files (efiboot)         |
 | tests/gefstest.c           | userland tests of the core and the ops layer    |
 | tests/sagefs/              | the libsa reader in userland                    |

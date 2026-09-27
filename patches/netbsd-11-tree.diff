@@ -1,0 +1,30 @@
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -1565,6 +1565,7 @@
+ include "fs/msdosfs/files.msdosfs"
+ include "fs/nilfs/files.nilfs"
+ include "fs/ntfs/files.ntfs"
++include "fs/gefs/files.gefs"
+ include "fs/ptyfs/files.ptyfs"
+ include "fs/puffs/files.puffs"
+ include "fs/udf/files.udf"
+--- a/sys/modules/Makefile
++++ b/sys/modules/Makefile
+@@ -71,6 +71,7 @@
+ SUBDIR+=	filecore
+ SUBDIR+=	flash
+ SUBDIR+=	fss
++SUBDIR+=	gefs
+ SUBDIR+=	gpio
+ SUBDIR+=	gpioiic
+ SUBDIR+=	gpioow
+--- a/sys/fs/Makefile
++++ b/sys/fs/Makefile
+@@ -1,6 +1,6 @@
+ #	$NetBSD: Makefile,v 1.22 2020/04/04 15:43:21 jdolecek Exp $
+ 
+-SUBDIR=	adosfs autofs cd9660 efs filecorefs hfs msdosfs nilfs ntfs ptyfs \
++SUBDIR=	adosfs autofs cd9660 efs filecorefs gefs hfs msdosfs nilfs ntfs ptyfs \
+ 	puffs sysvbfs tmpfs udf union v7fs
+ 
+ .include <bsd.kinc.mk>
