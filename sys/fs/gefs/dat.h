@@ -693,7 +693,7 @@ struct Cron {
 struct Mount {
 	Limbo;
 	Lock;
-	Mount	*next;
+	Mount	*mnext;	/* NetBSD: was next, which shadowed Limbo.next */
 	Along	ref;
 	vlong	gen;
 	char	name[64];

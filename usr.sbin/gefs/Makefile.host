@@ -1,0 +1,12 @@
+# Build the userland gefs tool on a host (Linux or NetBSD) with GCC.
+G=	../../sys/fs/gefs
+SRCS=	gefs.c $(G)/p9fmt.c $(G)/p9err.c $(G)/p9user.c $(G)/avl.c $(G)/hash.c \
+	$(G)/pack.c $(G)/blk.c $(G)/cache.c $(G)/tree.c $(G)/snap.c $(G)/load.c \
+	$(G)/ream.c $(G)/check.c $(G)/dump.c $(G)/error.c
+CFLAGS=	-std=gnu11 -fplan9-extensions -I$(G)/compat -I$(G) -O1 -g -Wall \
+	-Wno-unused -Wno-missing-braces -Wno-parentheses -Wno-sign-compare \
+	-Wno-unknown-pragmas -Wno-overflow -Wno-char-subscripts
+gefs: $(SRCS) $(G)/dat.h $(G)/fns.h $(G)/compat/libc.h
+	$(CC) $(CFLAGS) -o $@ $(SRCS) -lpthread
+clean:
+	rm -f gefs

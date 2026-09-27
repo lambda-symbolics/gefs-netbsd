@@ -22,12 +22,14 @@ extern ulong	fuzzseed;
 
 #define	UNPACK8(p)	(((uchar*)(p))[0])
 #define	UNPACK16(p)	((((uchar*)(p))[0]<<8)|(((uchar*)(p))[1]))
-#define	UNPACK32(p)	((((uchar*)(p))[0]<<24)|(((uchar*)(p))[1]<<16)|\
-				(((uchar*)(p))[2]<<8)|(((uchar*)(p))[3]))
-#define	UNPACK64(p)	(((u64int)((((uchar*)(p))[0]<<24)|(((uchar*)(p))[1]<<16)|\
-				(((uchar*)(p))[2]<<8)|(((uchar*)(p))[3])))<<32 |\
-			((u64int)((((uchar*)(p))[4]<<24)|(((uchar*)(p))[5]<<16)|\
-				(((uchar*)(p))[6]<<8)|(((uchar*)(p))[7]))))
+/*
+ * NetBSD: each byte is widened before it is shifted.  Plan 9's compilers
+ * promote uchar to unsigned int; ANSI compilers promote it to int, so
+ * p[0]<<24 went negative and sign-extended into the upper half.
+ */
+#define	UNPACK32(p)	(((u32int)((uchar*)(p))[0]<<24)|((u32int)((uchar*)(p))[1]<<16)|\
+			((u32int)((uchar*)(p))[2]<<8)|((u32int)((uchar*)(p))[3]))
+#define	UNPACK64(p)	(((u64int)UNPACK32(p))<<32 | (u64int)UNPACK32((uchar*)(p)+4))
 
 #define	PACK8(p,v)	do{(p)[0]=(v);}while(0)
 #define	PACK16(p,v)	do{(p)[0]=(v)>>8;(p)[1]=(v);}while(0)

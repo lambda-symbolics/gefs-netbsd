@@ -409,7 +409,7 @@ delsnap(Tree *t, vlong succ, char *name)
 	btupsert(&fs->snap, m, nm);
 	if(del){
 		reclaimblocks(t->gen, succ, t->pred);
-		for(mnt = agetp(&fs->mounts); mnt != nil; mnt = mnt->next){
+		for(mnt = agetp(&fs->mounts); mnt != nil; mnt = mnt->mnext){
 			r = agetp(&mnt->root);
 			if(r->gen == t->succ)
 				r->pred = t->pred;
@@ -566,7 +566,7 @@ opentree(vlong gen)
 	Kvp kv;
 	Key k;
 
-	for(mnt = agetp(&fs->mounts); mnt != nil; mnt = mnt->next){
+	for(mnt = agetp(&fs->mounts); mnt != nil; mnt = mnt->mnext){
 		t = agetp(&mnt->root);
 		if(t->gen == gen){
 			aincl(&t->memref, 1);
