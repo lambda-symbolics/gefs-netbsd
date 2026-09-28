@@ -316,6 +316,17 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
   close.  A 4 GB volume fills (dd gets ENOSPC), empties with rm, takes 2 GB
   again at once, unmounts and checks clean.
 
+- *On the X1 Nano (2026-09-28)*: the module and tools built against the
+  laptop's own NetBSD 11.0 tree.  A 16 GB volume on the (lent) swap
+  partition, against the FFS root with =log,noatime=, for 4 minutes of each
+  load, with the SSD's APST on (kernel 131): a log line every 2 s cost 8
+  commits (16 flushes); a file made and removed every 10 s, 8 commits;
+  fsync every 5 s, 48 commits and 96 flushes, 1737 writes against FFS's
+  691.  The drive slept 96-99 % of the time either way.  With APST on,
+  gefs is not a power lever at these rates, and fsync without an intent
+  log is its weak point.  Unmount: 76 commits, 97 skipped as clean over
+  the session.
+
 ** What the implementation taught
 
 - *12 KiB kernel stacks.*  The core's buffers (Kvmax-sized arrays, Scans) and
@@ -387,3 +398,5 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
 - 9front's dump view; ctime, extended attributes, NFS export (needs a qid
   index), ACLs.
 - Report the wstat truncation bug to Ori.
+- An intent log for fsync (a ZIL): an fsync would write its records and
+  one flush instead of a whole commit.

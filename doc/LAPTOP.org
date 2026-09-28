@@ -1,8 +1,13 @@
 #+TITLE: gefs on the X1 Nano: deployment and measurement plan
 #+DATE: 2026-09-28
 
-Nothing here has been done on the laptop yet; everything was tested in the
-NetBSD 11.0 VM (=/root/gefs-port/vm=).  The laptop runs NetBSD 11.0/amd64 with
+Step 1 and the measurement of step 2 were done on 2026-09-28 (see DESIGN.org,
+Status): the module and tools built against the laptop's tree as they are,
+on a volume on the swap partition (lent, and given back); the numbers are in
+nanobsd =docs/power-levers.org= too.  With the SSD's APST on (kernel 131),
+gefs did not beat FFS with =log,noatime= on power, and lost under fsync.
+Steps 3 and 4 are not done.  Everything else was tested in the NetBSD 11.0
+VM (=/root/gefs-port/vm=).  The laptop runs NetBSD 11.0/amd64 with
 the nanobsd patches, the same base, so the code should build as it is.
 Each step below can be undone, and the FFS root stays until the last one.
 
