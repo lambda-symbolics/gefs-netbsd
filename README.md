@@ -5,9 +5,10 @@ A native NetBSD port of GEFS, the copy-on-write Bε-tree file system of
 UBC), not FUSE, that NetBSD boots from and runs its root on, and that keeps a
 laptop's disk idle whenever nothing changes.
 
-Design, status and what the port taught: `doc/DESIGN.org`.  The 9front
-sources were imported unmodified in the first commit; every change to them
-since is marked `NetBSD:` in the code.
+Design, status and what the port taught: `doc/DESIGN.org`.  A plan for a
+more frugal write policy within the same format: `doc/GEFSPLUS.org`.  The
+9front sources were imported unmodified in the first commit; every change to
+them since is marked `NetBSD:` in the code.
 
 ## Layout
 

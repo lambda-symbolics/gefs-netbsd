@@ -1,0 +1,190 @@
+#+TITLE: gefs+: a frugal gefs that 9front still reads
+#+DATE: 2026-09-28
+
+A plan, not implemented.  gefs+ is this port with a different write policy:
+when the disk is written, what =fsync= waits for, how flushes are issued.
+The format stays 9front's, with one optional extension that 9front ignores,
+so Ori's gefs reads and writes a gefs+ volume and a cleanly unmounted one is
+a plain gefs volume.
+
+* Why
+
+With APST on (the X1 Nano, kernel 131) the SSD drops to PS4 100 ms after its
+last command.  A wake-up therefore costs roughly 150-170 ms of an awake drive
+whatever it writes, and the number of wake-ups is what costs power.  The bytes
+per wake-up (copy-on-write paths to the root, two flushes per commit) add
+milliseconds; they matter for wear, hardly for the battery.  Measured on the
+laptop (LAPTOP.org, nanobsd =docs/power-levers.org=): gefs wrote 1.5-2.5 times
+what FFS with =log,noatime= wrote, and the drive slept 96-99 % of the time
+under both.
+
+Where gefs stands: an idle gefs writes nothing, every commit is one wake-up,
+and every =fsync= is a commit (48 in 4 minutes at one =fsync= per 5 s, twice
+FFS's wake-ups).
+
+The ceiling is low.  At idle on FFS the drive is awake about 2 % of the time;
+a file system that never woke it would save that 2 % of the drive's awake
+power: tens of mW (estimate), about 1 % of the laptop's idle draw.  The
+difference =apst-ab= measures (APST on against off), divided by about 50,
+bounds it.
+
+The FFS baseline of those runs is high: a polling loop sshed into the laptop
+every 20-50 s during them (authlog, wtmpx on the FFS root), so FFS's ~7
+wake-ups a minute at idle overstate it.  Re-measure with no remote logins
+during the runs.
+
+* The format is the contract
+
+What 9front does with what gefs+ would touch, from the 9front sources in this
+tree:
+
+- Config keys (=Kconf=): 9front looks up only =retain= (=loadautos=, fs.c),
+  lists every key in its conf output (=showconf=, ctl.c) and removes keys only
+  by name.  Unknown keys survive its commits.
+- Its check (=checkfs=, check.c) covers the free list's order and log chains,
+  the deadlists, the snap tree, and every snapshot's tree and data pointers.
+  It does not look for blocks that are allocated but referenced by nothing.
+- The superblock (=packsb=, pack.c) is hashed over its fields only; the rest
+  of the 16 KiB block is unhashed, but 9front rewrites the superblock from
+  the buffer it loaded (=load.c=), so anything put there would outlive its
+  commits, stale.  Not used.
+- The features word (=fs->flag=) is read and printed, never checked, so it
+  cannot fence off an incompatible feature: gefs+ has to stay compatible by
+  construction.
+
+Off limits: file data inline in the tree (9front expects =Kdat= to point to a
+data block), another block size (=Lgblk= 14 is compiled in), compression, new
+message ops or key kinds in the trees.  They would cut writes, not wake-ups,
+so they would not help the battery anyway.
+
+* 1. One commit clock
+
+Today the syncer calls =VFS_SYNC= every =syncdelay= (30 s); =gefs_sync= pushes
+dirty pages into the tree (memory only) and commits if anything is dirty;
+=fsync=, =sync(2)= and unmount commit too.
+
+gefs+ commits on a beat of =vfs.gefs.interval= seconds (30 on AC, 120 on
+battery, set from powerd's =acadapter= script), and at once for =sync(2)=,
+=gefs sync=, unmount, =MNT_WAIT= syncs (shutdown), memory pressure (the queue's
+high-water mark, blk.c) and before suspend (the lid script would run =sync=
+before =hw.acpi.sleep.freeze=1=; the freeze stops userland, so nothing new
+gets dirty).  =gefs_sync= still pushes pages into the tree on every syncer
+pass; only the commit waits for the beat.
+
+Between beats nothing reaches the drive, however many programs write.  FFS
+works differently: each vnode is flushed on its own timer (=filedelay=,
+=dirdelay=, =metadelay=), the journal on the syncer's per-mount pass, so
+writes made at different moments wake the drive at different moments.
+Linux's =laptop_mode= does the same batching for in-place file systems, and
+NetBSD's syncer could get one, but FFS would still owe every =fsync= its own
+flush.
+
+Costs: a crash (panic, hard power-off) loses up to one beat of work, and more
+dirty data sits in memory, which makes the dirty-page space reservation in
+DESIGN.org "Next" matter more (today a 64 MiB =ENOSPC= margin).
+
+Size: small (a sysctl, a check in =gefs_sync=, a powerd script line).
+
+* 2. fsync that keeps order
+
+Today =gefs_fsync= pushes the file's pages into the tree (=VOP_PUTPAGES= with
+=PGO_SYNCIO=) and commits.  gefs+ with =-o fsync=order= does the same push and
+no commit; the next beat makes it durable.
+
+Why it is safe:
+- Every change enters the tree in one serial order, under =fs->mutlk=.
+  Creates, renames, removes and attribute changes enter when the call is
+  made.  File data enters when its pages are pushed, as jobs on the
+  mutator's queue, which calls =biodone= only once the data is in the tree.
+- A commit writes a cut of that order, atomically.
+- When =fsync(A)= returns, A's data is in the tree, so any later write, to any
+  file, enters after it: no commit can hold the later write without A.
+- After a crash the disk is the last commit, in the order programs asked for.
+  They lose their latest changes, not their consistency.  SQLite (Firefox's
+  databases) needs exactly this, since its WAL checksums catch a torn tail,
+  and git's object-then-ref order holds.  On FFS the same shortcut can
+  corrupt a database, since data is written in place, in no particular order.
+
+Unlike ZFS's =sync=disabled=, the push stays: UBC holds file data outside the
+tree, so without it a later write could reach a commit before an earlier
+one.
+
+Kept strict: =O_SYNC= and =O_DSYNC= writes, =MNT_SYNCHRONOUS= mounts, =sync(2)=,
+and every mount without the option, so a mail spool or a VM image can keep
+the full commit.
+
+With the option, a rename over an existing file first pushes the source's
+pages into the tree (ext4's =auto_da_alloc=).  Programs that rename without
+=fsync= then find no empty files after a crash.  It is cheap, memory only.
+
+Tests in the VM:
+- A writer does =write(A, n); fsync(A); write(B, n)= in a loop, with hard
+  resets (=ddb-reboot.sh=) at random; B must never be ahead of A.
+- An SQLite counter loop, with =PRAGMA integrity_check= after every reset.
+- A git commit loop, with =git fsck= after every reset.
+
+Precedents: OptFS's =osync= (Chidambaram et al., "Optimistic Crash
+Consistency", SOSP 2013); ZFS's =sync=disabled=.
+
+Size: small.
+
+* 3. Intent log, optional
+
+For mounts that need durable =fsync= without a whole commit.
+
+- Space: one fixed extent (say 4 MiB), allocated once through the normal
+  allocator, so both implementations see it as used.  No tree refers to it.
+  It is recorded in the file system's conf as =gefs+log= = "addr len".
+  9front never reads, frees or checks it.
+- Records: a header (magic; stamp = the hash of the superblock of the commit
+  they follow; sequence number; length; payload hash), then the tree
+  messages of the fsynced operations.  Small writes carry their data inline.
+  Big ones point at data blocks written to newly allocated places, which
+  replay marks allocated again.  =fsync= appends records and flushes once (or
+  uses FUA).
+- Reset for free: a commit changes the superblock hash, so every record
+  before it stops matching and nothing needs writing to empty the log.  A
+  full extent forces a commit.
+- Replay (gefs+ only, at mount): from the start of the extent, apply records
+  through the normal upsert path while magic, stamp, sequence and hash all
+  match, then commit.
+- With 9front: after a clean unmount the log is stale and the disk is plain
+  gefs.  After a crash, if 9front mounts first it sees the last commit and
+  loses only the logged seconds.  Once it commits, the stamps cannot match
+  and gefs+ ignores the old records.  The data blocks of big logged writes
+  were never committed as allocated, so 9front just reuses them.  The boot
+  loader reads the last commit and ignores the log.
+
+Power: one wake-up per =fsync=, as on FFS.  It buys durability, not battery.
+Size: the biggest piece (format, write path, replay, crash tests).
+
+* 4. Small things
+
+- One flush per commit: write the superblocks with =B_MEDIA_FUA= where the
+  disk reports =DKCACHE_FUA=, instead of the second =DIOCCACHESYNC=.  ld_nvme
+  passes FUA through; WAPBL has it behind =vfs.wapbl.allow_dpofua=.  It saves
+  milliseconds per wake-up, so it comes last.
+- Lazy commits (atime, deferred frees) already ride along with the next
+  commit, and happen alone at most every =Lazymax= (300 s).  On battery,
+  =Lazymax= could follow the beat.
+
+* Expected gain and measuring it
+
+As the root, with a 2-minute beat and =fsync=order=, the file system would
+wake the drive at most once per 2 minutes, Firefox or not.  The SSD would
+sleep about 99.8 % of the time instead of about 98 %: tens of mW (estimate),
+about 1 % of the idle draw.  That makes gefs a little better than FFS
+instead of a little worse.  Worth doing if gefs becomes the root for its
+snapshots and boot environments; not for power alone.
+
+Measuring: runs like the ones in LAPTOP.org (=iostat -x -w 1=, =nvmectl power=
+every 0.5 s) with no remote logins during a run, plus watts from =envstat='s
+discharge rate on battery (=apst-ab='s method), at least 30 minutes per
+setting.  Compare the FFS root, a gefs root (beat 30 s, =fsync= commits) and
+gefs+ (beat 120 s, =fsync=order=).
+
+* Order
+
+1, then 2 with the VM tests.  Then measure on the laptop against FFS; a gefs
+label mounted as =/home= is enough to try, the root can come later.  3 only
+where 2's trade is unacceptable.  4 whenever.

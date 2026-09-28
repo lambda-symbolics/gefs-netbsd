@@ -398,5 +398,6 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
 - 9front's dump view; ctime, extended attributes, NFS export (needs a qid
   index), ACLs.
 - Report the wstat truncation bug to Ori.
-- An intent log for fsync (a ZIL): an fsync would write its records and
-  one flush instead of a whole commit.
+- gefs+ (=doc/GEFSPLUS.org=): commits on a beat (longer on battery), an
+  fsync that keeps order and is saved by the next beat, and optionally an
+  intent log (a ZIL) for a durable fsync, all within 9front's format.
