@@ -1,0 +1,57 @@
+gefs: wstat truncation to an unaligned length leaks blocks and brings old
+data back when the file grows
+
+Found while porting gefs to NetBSD (9front 2096014, 2026-09-26).
+Not sent anywhere; for Ori, if and when you want to.
+
+In fswstat (fs.c), a shorter length queues an AOclear from the new length:
+
+		(*ao)->off = d.length;
+		(*ao)->end = f->dent->length;
+
+runsweep's AOclear then sends Oclearb for off, off+Blksz, ... up to end.
+Kdat keys are at block-aligned offsets, so when d.length is not a multiple
+of Blksz none of these keys exists and nothing is cleared:
+
+1. every block after the new end stays allocated (a leak until the file
+   is removed), and
+2. those blocks, and the tail of the block holding the new end, still hold
+   the old data.  readb stops at the length, so it does not show at once;
+   but after the file grows again (a later wstat to a bigger length, or a
+   write past the end), reads of the grown part return the old bytes where
+   there should be zeros.
+
+To see it (on 9front):
+
+	#include <u.h>
+	#include <libc.h>
+	void
+	main(void)
+	{
+		char buf[40000];
+		Dir d;
+		int fd;
+
+		memset(buf, 'x', sizeof buf);
+		fd = create("/tmp/t", ORDWR, 0644);
+		write(fd, buf, sizeof buf);	/* three blocks */
+		nulldir(&d);
+		d.length = 100;			/* not a multiple of Blksz */
+		dirfwstat(fd, &d);
+		nulldir(&d);
+		d.length = sizeof buf;		/* grow it back */
+		dirfwstat(fd, &d);
+		pread(fd, buf, sizeof buf, 0);
+		print("%c %c\n", buf[200], buf[30000]);	/* want NUL NUL, get x x */
+		exits(nil);
+	}
+
+A fix, as the NetBSD port does it (gefstrunc in sys/fs/gefs/ops.c):
+
+- clear whole blocks from the new end rounded up:
+		(*ao)->off = (d.length + Blksz-1) & ~(Blksz-1);
+- and rewrite the block holding the new end with zeros after it, in the
+  same upsert as the Owsize: writeb(f, &mb[nm], &bp, zeros, d.length,
+  Blksz - d.length%Blksz, de->length), one more message.
+
+The OTRUNC path (fsopen) clears from 0 and is not affected.
