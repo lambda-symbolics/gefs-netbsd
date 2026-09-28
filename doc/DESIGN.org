@@ -237,6 +237,11 @@ mode as mount options.
 - efiboot lists it with its other file systems (=patches/netbsd-11-efiboot.diff=)
   and boots the GPT partition marked =bootme=.  The BIOS boot blocks
   (bootxx) cannot read gefs; UEFI only.
+- Boot environments: a kernel loaded from =@label/...= mounts that label as
+  its root (=get_booted_kernel()=, the path the loader was given, is
+  machine independent).  =gefs fork / main pre-upgrade= before an upgrade,
+  =boot @pre-upgrade/netbsd= to go back: tested under UEFI, the fork runs
+  read-write and main is untouched.
 - GPT type for gefs partitions (proposed, not registered):
   =38417555-670b-4a70-8e7a-bd7ce366f5a1=.
 
@@ -283,8 +288,13 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
   kernel under OVMF: efiboot reads boot.cfg, the entropy file and the 29 MB
   kernel from gefs, the kernel finds its root from the boot wedge and runs
   multi-user from gefs; writes survive reboots; =ls= at the boot prompt;
-  =boot @before-reboot/netbsd= loads the kernel from a snapshot.  The reader
-  in userland read 939 files of the root identically to the kernel.
+  =boot @before-reboot/netbsd= loads the kernel from a snapshot, and
+  =boot @pre-upgrade/netbsd= boots a fork as the root.  The reader in
+  userland read 939 files of the root identically to the kernel.
+- *Workloads*: a GENERIC kernel builds entirely on gefs (sources and
+  objects) in 280 s, as on FFS; on the UEFI-booted gefs root, /usr copied
+  and compared, fsxlite runs alone and four at once, and a power cut during
+  a 345 MB copy left a root that boots at once and checks clean.
 - *Low memory*: filling the file system with dd deadlocked the VM (no free
   pages: the pagedaemon gave the mutator dirty pages to write, the mutator
   waited for memory).  Now writes are pushed into the tree behind the writer
@@ -370,8 +380,6 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
   decide about a gefs root there.
 - Space reservations for dirty pages (today: a 64 MiB margin; many small
   files written within one syncer interval could still overcommit).
-- A root booted from a snapshot (a boot environment): pass the label from
-  the loader to the kernel.
 - 9front's dump view; ctime, extended attributes, NFS export (needs a qid
   index), ACLs.
 - Report the wstat truncation bug to Ori.

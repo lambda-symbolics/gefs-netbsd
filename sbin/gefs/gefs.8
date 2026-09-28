@@ -197,7 +197,21 @@ boot @main@day.2026.09.27_00:00:00/netbsd
 .Pp
 A kernel with gefs built in finds its root from the boot loader and
 mounts
-.Dq main .
+.Dq main ,
+or the label it was itself loaded from: a boot environment.
+Fork the system before an upgrade, and boot the fork if the upgrade
+goes wrong:
+.Bd -literal -offset indent
+gefs fork / main pre-upgrade
+\&... upgrade ...
+boot @pre-upgrade/netbsd	(at the boot loader's prompt)
+.Ed
+.Pp
+A fork runs read-write as the root; a snapshot runs read-only.
+A
+.Xr boot.cfg 5
+line makes it a menu entry:
+.Dl menu=Before the upgrade:boot @pre-upgrade/netbsd
 .Sh EXAMPLES
 Make a gefs root partition that the EFI loader boots from:
 .Bd -literal -offset indent

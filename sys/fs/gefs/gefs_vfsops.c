@@ -880,6 +880,29 @@ gefs_loadvnode(struct mount *mp, struct vnode *vp, const void *key,
 	return 0;
 }
 
+/*
+ * Boot environments: a kernel the boot loader read from a label
+ * ("boot @pre-upgrade/netbsd") runs with that label as its root.  A fork
+ * is mounted read-write as usual; a snapshot stays read-only.
+ */
+static void
+gefs_rootlabel(char *label, size_t n)
+{
+	const char *bk, *e;
+
+	label[0] = 0;
+	if((bk = get_booted_kernel()) == NULL)
+		return;
+	while(*bk == '/')
+		bk++;
+	if(*bk++ != '@' || (e = strchr(bk, '/')) == NULL || e == bk ||
+	    (size_t)(e - bk) >= n)
+		return;
+	memcpy(label, bk, e - bk);
+	label[e - bk] = 0;
+	printf("gefs: root label %s, from the boot loader\n", label);
+}
+
 /* the root file system: the kernel opened rootvp for reading */
 static int
 gefs_mountroot(void)
@@ -896,6 +919,7 @@ gefs_mountroot(void)
 		return error;
 	}
 	memset(&args, 0, sizeof(args));
+	gefs_rootlabel(args.snap, sizeof(args.snap));
 	mp->mnt_flag |= MNT_FORCE;
 	rw_enter(&gefs_mntlock, RW_WRITER);
 	error = gefs_mountfs(rootvp, mp, l, &args, FREAD);
