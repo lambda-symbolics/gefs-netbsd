@@ -291,6 +291,10 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
   =boot @before-reboot/netbsd= loads the kernel from a snapshot, and
   =boot @pre-upgrade/netbsd= boots a fork as the root.  The reader in
   userland read 939 files of the root identically to the kernel.
+- *An idle gefs root*: the UEFI-booted system with its daemons running
+  (cron, syslogd, dhcpcd, sshd, powerd, inetd) committed once in 5
+  minutes (9 syncer calls skipped as clean): 63 block writes, 2 cache
+  flushes (=sysctl vfs.gefs=).
 - *Workloads*: a GENERIC kernel builds entirely on gefs (sources and
   objects) in 280 s, as on FFS; on the UEFI-booted gefs root, /usr copied
   and compared, fsxlite runs alone and four at once, and a power cut during
