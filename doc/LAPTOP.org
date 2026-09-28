@@ -1,0 +1,65 @@
+#+TITLE: gefs on the X1 Nano: deployment and measurement plan
+#+DATE: 2026-09-28
+
+Nothing here has been done on the laptop yet; everything was tested in the
+NetBSD 11.0 VM (=/root/gefs-port/vm=).  The laptop runs NetBSD 11.0/amd64 with
+the nanobsd patches, the same base, so the code should build as it is.
+Each step below can be undone, and the FFS root stays until the last one.
+
+* 1. The module, on a scratch device (no reboot)
+
+- Copy the repository over (a git bundle is simplest), link or copy
+  =sys/fs/gefs= and =sys/modules/gefs= into the laptop's =/usr/src/sys=,
+  build and load:
+  : cd /usr/src/sys/modules/gefs && make && modload ./gefs.kmod
+- Tools: =cd sbin/gefs && make= (or =make -f Makefile.host=), install
+  =gefs= as =/sbin/gefs= with the links =newfs_gefs= and =fsck_gefs=;
+  =sbin/mount_gefs=: =make && install=.
+- Scratch device: a spare partition, or a vnd on a file
+  (=vndconfig vnd0 /var/tmp/g.img=; the FFS underneath then writes too,
+  so measure power only on a real partition).
+- Checks: =tests/fsxlite.c= (a few seeds, =-m=), a kernel or pkgsrc build
+  on it, =gefs check=.
+
+* 2. Power, compared with FFS
+
+- Counters: =sysctl vfs.gefs= (commits, skipped, reads, writes, flushes:
+  totals over the mounted gefs devices), =iostat -w 10 ld0= or =nvme0=,
+  battery rate from =envstat -d acpibat0=.
+- Idle for an hour with the session up: gefs should show no commits and
+  no flushes; compare the drive's time asleep and the battery rate with
+  the same hour on FFS.
+- Active: the usual desktop day; watch =vfs.gefs.flushes=.  Each fsync
+  is a commit with two cache flushes (gefs has no intent log), so
+  programs that fsync often cost wake-ups: Firefox's SQLite databases
+  are the likely one.  If they dominate, keep =~/.mozilla= on FFS, or tune
+  Firefox's storage sync (=toolkit.storage.synchronous=).
+- The syncer commits a changed gefs at most every =kern.syncdelay= seconds
+  (30); a longer delay batches more into one commit, at the price of what a
+  crash can lose.
+
+* 3. Booting from gefs, next to the current setup
+
+- A kernel with gefs built in: apply =patches/netbsd-11-tree.diff= (or
+  add =include "fs/gefs/files.gefs"= to the config) and =file-system GEFS=
+  to the laptop's kernel config; install it as =/netbsd.gefs= next to
+  the current kernel.
+- The EFI loader with gefs: =patches/netbsd-11-efiboot.diff= plus
+  =sys/lib/libsa/gefs.[ch]=; build =sys/arch/i386/stand/efiboot/bootx64=
+  and install it on the ESP as a second loader (=EFI/NetBSD/gefsboot.efi=,
+  a firmware boot entry with =efibootmgr=, or chosen from the firmware's
+  menu), keeping =BOOTX64.EFI= as it is.
+
+* 4. A gefs root (needs a partition; ask first)
+
+- A GPT partition (type 38417555-670b-4a70-8e7a-bd7ce366f5a1, label
+  e.g. =gefsroot=), =newfs_gefs=, the system copied with =pax -rw -pe=,
+  its =fstab=: =NAME=gefsroot / gefs rw 0 0= (pass 0: gefs needs no
+  fsck), =boot.cfg= on it.  Set =bootme= on it only once it has booted
+  from the loader's prompt (=boot hd0X:/netbsd=).
+- Snapshots: =gefs retain / main '60@m 24@h 14@d'= is the default
+  newfs_gefs sets; build trees (=/usr/obj=, pkgsrc =WRKOBJDIR=) belong
+  in their own fork with =retain none=, or the snapshots keep every
+  deleted object file for two weeks.
+- Before an upgrade: =gefs fork / main pre-upgrade=; to go back, =boot
+  @pre-upgrade/netbsd= at the loader's prompt.
