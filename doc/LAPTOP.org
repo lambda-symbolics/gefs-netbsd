@@ -47,7 +47,7 @@ Each step below can be undone, and the FFS root stays until the last one.
 - The EFI loader with gefs: =patches/netbsd-11-efiboot.diff= plus
   =sys/lib/libsa/gefs.[ch]=; build =sys/arch/i386/stand/efiboot/bootx64=
   and install it on the ESP as a second loader (=EFI/NetBSD/gefsboot.efi=,
-  a firmware boot entry with =efibootmgr=, or chosen from the firmware's
+  a firmware boot entry with efi(8), or chosen from the firmware's
   menu), keeping =BOOTX64.EFI= as it is.
 
 * 4. A gefs root (needs a partition; ask first)
