@@ -881,8 +881,9 @@ gefs_fsync(void *v)
 			return error;
 	}
 	/*
-	 * No intent log: a durable fsync is a commit.  Not when the vnode is
-	 * being reclaimed, which flushes its pages this way too.
+	 * No intent log: a durable fsync waits for a commit, one that every
+	 * fsync it covers shares (gefs_durable).  Not when the vnode is being
+	 * reclaimed, which flushes its pages this way too.
 	 */
 	if(!(ap->a_flags & FSYNC_LAZY) && !(vp->v_mount->mnt_flag & MNT_RDONLY)){
 		int dying;

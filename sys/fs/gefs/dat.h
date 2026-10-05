@@ -575,6 +575,15 @@ struct Gefs {
 	vlong	ncommit;	/* NetBSD: commits written */
 	vlong	nskip;		/* NetBSD: commits skipped, nothing dirty */
 	vlong	lastcommit;	/* NetBSD: nsec() of the last commit */
+	/*
+	 * NetBSD: commits are numbered by their cut, the moment pass 0 of
+	 * fssync takes the trees (under mutlk).  A change made before cut n
+	 * is in commit n or an earlier one; cmtdone is the last commit known
+	 * durable (headers and superblocks flushed).  Group commit waits on
+	 * these (gefs_work.c).
+	 */
+	Avlong	cmtcut;
+	Avlong	cmtdone;
 	Blk	**blkall;	/* NetBSD: every cache block, to free them */
 	void	*sweepq;	/* NetBSD: deleted trees to sweep after the next commit */
 	Along	broken;		/* NetBSD: it broke; read-only until unmounted */

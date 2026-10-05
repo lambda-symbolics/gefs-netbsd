@@ -55,6 +55,16 @@ struct gefs_ctl {
 #define GEFS_MAXWQ	64		/* page writes queued: 4 MiB of pager VA */
 #define GEFS_WMARGIN	(64*1024*1024)	/* write(2) says ENOSPC this much early */
 
+/* why the mutator commits (gd_nwhy) */
+enum {
+	GEFS_WSYNC,	/* fsync, O_SYNC, sync(2), shutdown */
+	GEFS_WAGE,	/* a change is vfs.gefs.interval old */
+	GEFS_WDIRTY,	/* queued blocks passed vfs.gefs.dirtypct of the cache */
+	GEFS_WSPACE,	/* little space left: commit to free what was freed */
+	GEFS_WLAZY,	/* only lazy updates (atime, frees), Lazymax old */
+	GEFS_NWHY
+};
+
 struct gefsjob;
 struct gefsmount;
 TAILQ_HEAD(gefsjobq, gefsjob);
@@ -88,6 +98,28 @@ struct gefsdev {
 	kcondvar_t	gd_wqcv;	/* room in the write queue */
 	struct lwp	*gd_mutlwp;	/* the mutator */
 	volatile int	gd_lazyq;	/* a lazy commit is queued */
+	/*
+	 * Commits, gefs_work.c: the mutator runs them, for requests (group
+	 * commit) and by the background policy.  With gd_jlk.
+	 */
+	kcondvar_t	gd_cmtcv;	/* a commit finished, or failed */
+	uint64_t	gd_jenq;	/* mutator jobs queued, ever */
+	uint64_t	gd_jtaken;	/* mutator jobs taken, ever */
+	int		gd_cmtwant;	/* a commit is requested ... */
+	int		gd_cmtflags;	/* ... with these commit() flags ... */
+	uint64_t	gd_cmtticket;	/* ... after the jobs queued before it ... */
+	uint64_t	gd_cmtdue;	/* ... and not before this uptime, ns */
+	int64_t		gd_cmtneed;	/* the latest commit a waiter needs */
+	uint64_t	gd_nfail;	/* commits that failed waiters */
+	int		gd_cmterr;	/* the last failure's errno */
+	uint64_t	gd_dirtyat;	/* uptime the tree got dirty, 0: clean */
+	uint64_t	gd_lastcmt;	/* uptime of the last commit written */
+	int64_t		gd_ncmtseen;	/* the core's ncommit at the last look */
+	uint64_t	gd_spaceat;	/* uptime of the last commit for space */
+	/* counters, for vfs.gefs */
+	uint64_t	gd_nreq;	/* durability requests (fsync, O_SYNC, sync) */
+	uint64_t	gd_njoin;	/* ... that started no commit of their own */
+	uint64_t	gd_nwhy[GEFS_NWHY];	/* commits run, by reason */
 };
 
 /* One per NetBSD mount: a label of a device. */
@@ -142,6 +174,10 @@ void	gefs_work_stop(struct gefsdev *);
 int	gefs_call(struct gefsmount *, void (*)(struct gefsmount *, void *), void *);
 void	gefs_post(struct gefsmount *, void (*)(struct gefsmount *, void *), void *);
 void	gefs_queuebuf(struct gefsmount *, struct vnode *, struct buf *);
+int	gefs_durable(struct gefsmount *, int);
+void	gefs_cmtrequest(struct gefsmount *, int);
+void	gefs_kick(struct gefsdev *);
+extern int	gefs_interval, gefs_groupwait, gefs_dirtypct;
 
 /* gefs_vfsops.c */
 extern int	gefs_trace;

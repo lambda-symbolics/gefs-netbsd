@@ -7,8 +7,13 @@
  *    flushes the device's write cache, since there are no sync procs.
  *  - A commit flushes the device twice, after the arena headers and after
  *    the superblocks; the arena footers wait for the next commit's flush.
- *  - commit() does nothing when nothing changed.  It is called by NetBSD's
- *    syncer, fsync, sync and unmount, never by a timer.
+ *  - commit() does nothing when nothing changed.  In the kernel the
+ *    mutator thread calls it: for fsync and sync (group commit: one
+ *    commit for every request it covers), when the oldest change is
+ *    vfs.gefs.interval old, under dirty-memory or space pressure, and
+ *    at unmount (gefs_work.c).
+ *  - Commits are numbered by their cut (cmtcut), and cmtdone says which
+ *    one is durable, for fsync callers to wait on.
  *  - Mount.next is Mount.mnext (it shadowed Limbo.next).
  */
 #include <u.h>
@@ -47,6 +52,7 @@ fssync(void)
 	Arena *a;
 	Dlist *sdl, ddl;
 	Tree *r;
+	vlong cut;
 	int i, ok;
 
 	qlock(&fs->synclk);
@@ -129,6 +135,7 @@ fssync(void)
 	finalize(fs->sb1);
 	fs->snap.dirty = 0;
 	aswapl(&fs->lazydirty, 0);
+	cut = aincv(&fs->cmtcut, 1);
 	qunlock(&fs->mutlk);
 	poperror();
 
@@ -155,6 +162,8 @@ fssync(void)
 	enqueue(fs->sb1);
 	wrbarrier();
 	wrwait(1);
+	/* NetBSD: everything up to the cut is durable now */
+	aswapv(&fs->cmtdone, cut);
 
 	/*
 	 * pass 3: sync block footers; if we crash here,

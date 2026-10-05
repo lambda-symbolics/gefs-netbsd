@@ -41,9 +41,10 @@ static krwlock_t	gefs_mntlock;	/* orders mounts and unmounts, guards the lists *
 static LIST_HEAD(, gefsdev) gefs_devs = LIST_HEAD_INITIALIZER(gefs_devs);
 
 /*
- * vfs.gefs.{commits,skipped,reads,writes,flushes}: totals over the mounted
- * devices, for measuring what the disk does (iostat counts transfers;
- * these count commits, the cache flushes that wake a drive, and blocks).
+ * vfs.gefs.{commits,skipped,reads,writes,flushes,...}: totals over the
+ * mounted devices, for measuring what the disk does (iostat counts
+ * transfers; these count commits, the cache flushes that wake a drive,
+ * and blocks), and why the commits ran.
  */
 static int
 gefs_sysctl_stat(SYSCTLFN_ARGS)
@@ -63,7 +64,10 @@ gefs_sysctl_stat(SYSCTLFN_ARGS)
 		case 1: v = gd->gd_fs->nskip; break;
 		case 2: v = r; break;
 		case 3: v = w; break;
-		default: v = f; break;
+		case 4: v = f; break;
+		case 5: v = gd->gd_nreq; break;
+		case 6: v = gd->gd_njoin; break;
+		default: v = gd->gd_nwhy[which - 7]; break;
 		}
 		q += v;
 	}
@@ -72,15 +76,54 @@ gefs_sysctl_stat(SYSCTLFN_ARGS)
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
 
-static int gefs_statsel[] = { 0, 1, 2, 3, 4 };
+static int gefs_statsel[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+
+/* a tunable changed: the mutators re-read it */
+static int
+gefs_sysctl_tune(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct gefsdev *gd;
+	int error, v;
+
+	v = *(int *)rnode->sysctl_data;
+	node.sysctl_data = &v;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if(error || newp == NULL)
+		return error;
+	if(v < 0 || (rnode->sysctl_data == &gefs_dirtypct && v > 100) ||
+	    (rnode->sysctl_data == &gefs_groupwait && v > 1000000))
+		return EINVAL;
+	*(int *)rnode->sysctl_data = v;
+	rw_enter(&gefs_mntlock, RW_READER);
+	LIST_FOREACH(gd, &gefs_devs, gd_link)
+		gefs_kick(gd);
+	rw_exit(&gefs_mntlock);
+	return 0;
+}
 
 static void
 gefs_sysctl_init(void)
 {
-	static const char *names[] = { "commits", "skipped", "reads", "writes", "flushes" };
+	static const char *names[] = { "commits", "skipped", "reads", "writes",
+		"flushes", "requests", "joined", "commits_sync", "commits_age",
+		"commits_dirty", "commits_space", "commits_lazy" };
 	static const char *descr[] = {
 		"commits written", "commits skipped, nothing changed",
-		"blocks read", "blocks written", "device cache flushes" };
+		"blocks read", "blocks written", "device cache flushes",
+		"durability requests (fsync, O_SYNC writes, sync)",
+		"requests that started no commit of their own",
+		"commits run for requests", "commits run for the interval",
+		"commits run for dirty memory", "commits run for space",
+		"commits run for lazy updates alone" };
+	static const struct { const char *n, *d; int *v; } tune[] = {
+		{ "interval", "seconds a change may wait for a commit, at most",
+		    &gefs_interval },
+		{ "groupwait", "microseconds a requested commit waits for more requests",
+		    &gefs_groupwait },
+		{ "dirtypct", "commit when queued blocks pass this % of the cache",
+		    &gefs_dirtypct },
+	};
 	const struct sysctlnode *node;
 	int i;
 
@@ -97,6 +140,11 @@ gefs_sysctl_init(void)
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "cachemb",
 	    SYSCTL_DESCR("block cache of a new mount, MiB"), NULL, 0,
 	    &gefs_cachemb, 0, CTL_CREATE, CTL_EOL);
+	for(i = 0; i < (int)__arraycount(tune); i++)
+		sysctl_createv(&gefs_sysctl_log, 0, &node, NULL,
+		    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, tune[i].n,
+		    SYSCTL_DESCR(tune[i].d), gefs_sysctl_tune, 0,
+		    tune[i].v, 0, CTL_CREATE, CTL_EOL);
 	for(i = 0; i < (int)__arraycount(names); i++)
 		sysctl_createv(&gefs_sysctl_log, 0, &node, NULL,
 		    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_QUAD, names[i],
@@ -322,28 +370,43 @@ gefs_rojob(struct gefsmount *gm, void *arg)
 		aswapl(&fs->rdonly, 1);
 }
 
-static void
-gefs_commitjob(struct gefsmount *gm, void *arg)
-{
-	int flags = (int)(intptr_t)arg;
-
-	gm->gm_gd->gd_lazyq = 0;
-	commit(flags);
-}
-
-/* commit on the mutator, waiting for it, or not (MNT_LAZY) */
+/*
+ * Everything changed so far to the disk: wait for a durable commit that
+ * holds it (shared with other callers, gefs_durable), or only ask for
+ * one soon (sync(2)).
+ */
 int
 gefs_commit(struct gefsmount *gm, int wait, int flags)
 {
-	struct gefsdev *gd = gm->gm_gd;
-
 	if(wait)
-		return gefs_call(gm, gefs_commitjob, (void*)(intptr_t)flags);
-	if(!gd->gd_lazyq){
-		gd->gd_lazyq = 1;
-		gefs_post(gm, gefs_commitjob, (void*)(intptr_t)flags);
-	}
+		return gefs_durable(gm, flags);
+	gefs_cmtrequest(gm, flags);
 	return 0;
+}
+
+/*
+ * On the mutator, after the syncer's page writes: those pages may have
+ * been dirty since the syncer's previous pass, so the tree's changes
+ * count as that old.  With the default interval (= syncdelay) the
+ * syncer's pass commits, as before; a longer interval delays it.
+ */
+static void
+gefs_agejob(struct gefsmount *gm, void *arg)
+{
+	struct gefsdev *gd = gm->gm_gd;
+	struct timespec ts;
+	uint64_t now, back;
+
+	USED(arg);
+	nanouptime(&ts);
+	now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+	back = (uint64_t)syncdelay * 1000000000ULL;
+	mutex_enter(&gd->gd_jlk);
+	gd->gd_lazyq = 0;
+	if(gd->gd_fs->snap.dirty && now > back &&
+	    (gd->gd_dirtyat == 0 || gd->gd_dirtyat > now - back))
+		gd->gd_dirtyat = now - back;
+	mutex_exit(&gd->gd_jlk);
 }
 
 static struct gefsmount*
@@ -611,9 +674,11 @@ gefs_unmount(struct mount *mp, int mntflags)
 	gefs_work_stop(gd);
 	gefsdevstats(gd->gd_fd, &r, &w, &f);
 	printf("gefs: %s unmounted: %lld commits, %lld skipped as clean; "
+	    "%llu durability requests, %llu joined another's commit; "
 	    "device %lld reads, %lld writes, %lld cache flushes\n",
 	    gm->gm_label, (long long)gd->gd_fs->ncommit,
-	    (long long)gd->gd_fs->nskip, r, w, f);
+	    (long long)gd->gd_fs->nskip, (unsigned long long)gd->gd_nreq,
+	    (unsigned long long)gd->gd_njoin, r, w, f);
 	gefs_freefs(gd->gd_fs);
 	spec_node_setmountedfs(devvp, NULL);
 	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
@@ -723,17 +788,31 @@ gefs_sync(struct mount *mp, int waitfor, kauth_cred_t cred)
 {
 	struct gefsmount *gm = VFSTOGEFS(mp);
 
+	struct gefsdev *gd = gm->gm_gd;
+
 	if(gm->gm_ronly)
 		return 0;
 	/* data only, not waiting for busy vnodes: the commit follows once */
 	gefs_putall(mp, 0);
 	/*
-	 * The page writes above are queued on the mutator; the commit goes
-	 * after them.  The syncer does not wait for it.
+	 * The page writes above are queued on the mutator; a commit goes
+	 * after them.  The syncer's pass leaves the commit to the background
+	 * policy (vfs.gefs.interval); sync(2) asks for one now and does not
+	 * wait; shutdown and unmount wait for it.
 	 */
 	if(waitfor == MNT_WAIT)
 		return gefs_commit(gm, 1, Clazy);
-	return gefs_commit(gm, 0, 0);
+	if(waitfor == MNT_NOWAIT)
+		return gefs_commit(gm, 0, 0);
+	mutex_enter(&gd->gd_jlk);
+	if(gd->gd_lazyq){
+		mutex_exit(&gd->gd_jlk);
+		return 0;
+	}
+	gd->gd_lazyq = 1;
+	mutex_exit(&gd->gd_jlk);
+	gefs_post(gm, gefs_agejob, NULL);
+	return 0;
 }
 
 /* --- administration: GEFSIOC_CTL and GEFSIOC_STATUS --- */
