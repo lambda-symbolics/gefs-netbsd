@@ -585,6 +585,14 @@ gefs_queuebuf(struct gefsmount *gm, struct vnode *vp, struct buf *bp)
 
 	rd = (bp->b_flags & B_READ) != 0;
 	pd = (curlwp == uvm.pagedaemon_lwp);
+	/*
+	 * The pagedaemon may take a page of a write that extends the file
+	 * between the copy and the new v_size (gefs_write): the page write
+	 * would drop what lies past v_size and leave the page clean.  Later.
+	 */
+	if(pd && !rd && vp->v_writesize > vp->v_size &&
+	    ((off_t)bp->b_blkno << DEV_BSHIFT) + bp->b_bcount > vp->v_size)
+		goto nomem;
 	j = kmem_zalloc(sizeof(*j), pd ? KM_NOSLEEP : KM_SLEEP);
 	if(j == NULL)
 		goto nomem;

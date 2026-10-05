@@ -815,8 +815,23 @@ gefs_write(void *v)
 		off_t oldoff = uio->uio_offset;
 
 		len = MIN(uio->uio_resid, GEFS_WBEHIND);
+		if(vp->v_size < nsize)
+			uvm_vnp_setwritesize(vp, nsize);	/* setsize lowers it */
 		error = ubc_uiomove(&vp->v_uobj, uio, len, IO_ADV_DECODE(ioflag),
 		    UBC_WRITE | UBC_VNODE_FLAGS(vp));
+		/*
+		 * As FFS: the size covers what is copied before any of it is
+		 * put.  A page write takes the file's size from v_size when it
+		 * runs on the mutator, maybe before this call returns, and
+		 * drops what lies past it; the page is clean then, so the data
+		 * was lost (a record across a 1 MiB boundary, write-behind).
+		 */
+		if(uio->uio_offset > vp->v_size){
+			uvm_vnp_setsize(vp, uio->uio_offset);
+			wlock(de);
+			de->length = uio->uio_offset;
+			wunlock(de);
+		}
 		/*
 		 * Write-behind, as FFS: whole windows this write filled go
 		 * into the tree now (not to the disk: that is the commit's),
@@ -839,14 +854,9 @@ gefs_write(void *v)
 		}
 	}
 	if(error){
-		uvm_vnp_setsize(vp, osize);
+		/* what was copied stays, as on FFS; v_writesize comes down */
+		uvm_vnp_setsize(vp, vp->v_size);
 		return error;
-	}
-	if(nsize != osize){
-		uvm_vnp_setsize(vp, nsize);
-		wlock(de);
-		de->length = nsize;
-		wunlock(de);
 	}
 	/* in memory for stat now; the tree gets it when the pages are put */
 	wlock(de);
