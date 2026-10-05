@@ -171,15 +171,18 @@ gefs_thread(struct gefsdev *gd, struct gefsjobq *q, kcondvar_t *cv)
  * microseconds after the request (0 by default).
  *
  * Background: a dirty tree is committed when its oldest change is
- * vfs.gefs.interval seconds old, earlier when the blocks queued for
- * writing pass vfs.gefs.dirtypct percent of the block cache or the
- * space outside the reserve runs low (at most once a second), and lazy
- * updates alone go out after Lazymax.  A clean file system does nothing:
- * the mutator sleeps without a timeout.
+ * vfs.gefs.interval seconds old, earlier when the space outside the
+ * reserve runs low (at most once a second), and lazy updates alone go
+ * out after Lazymax.  vfs.gefs.dirtypct, off by default, also commits
+ * when the blocks queued for writing pass that percent of the block
+ * cache; memory does not need it (a full queue or cache is drained, which
+ * writes without a commit), and with 25 a 1.5 GB dd took 145 commits and
+ * 290 flushes instead of 1 and 2, and twice the time.  A clean file
+ * system does nothing: the mutator sleeps without a timeout.
  */
 int	gefs_interval = 30;	/* vfs.gefs.interval, s: oldest change, at most */
 int	gefs_groupwait = 0;	/* vfs.gefs.groupwait, us: wait for more fsyncs */
-int	gefs_dirtypct = 25;	/* vfs.gefs.dirtypct: queued blocks, % of the cache */
+int	gefs_dirtypct = 0;	/* vfs.gefs.dirtypct: queued blocks, % of the cache; 0: off */
 
 #define GEFS_SPACEMIN	(2LL*GEFS_WMARGIN)	/* commit below this, for space */
 #define NS		1000000000ULL
@@ -288,7 +291,8 @@ gefs_cmtdue(struct gefsdev *gd, uint64_t *sleepns)
 		if(f->snap.dirty){
 			if(now - gd->gd_dirtyat >= (uint64_t)interval)
 				return GEFS_WAGE;
-			if(gefs_queued(f) > f->cmax * gefs_dirtypct / 100)
+			if(gefs_dirtypct > 0 &&
+			    gefs_queued(f) > f->cmax * gefs_dirtypct / 100)
 				return GEFS_WDIRTY;
 			if(now - gd->gd_spaceat >= NS && gefs_lowspace(f)){
 				gd->gd_spaceat = now;

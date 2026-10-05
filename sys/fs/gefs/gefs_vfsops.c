@@ -121,7 +121,7 @@ gefs_sysctl_init(void)
 		    &gefs_interval },
 		{ "groupwait", "microseconds a requested commit waits for more requests",
 		    &gefs_groupwait },
-		{ "dirtypct", "commit when queued blocks pass this % of the cache",
+		{ "dirtypct", "commit when queued blocks pass this % of the cache (0: off)",
 		    &gefs_dirtypct },
 	};
 	const struct sysctlnode *node;
