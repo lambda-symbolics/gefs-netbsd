@@ -55,12 +55,50 @@ since
 .Pq Dq relatime ,
 and reach the disk with the next commit that happens anyway.
 .Sh POWER
-gefs writes nothing while nothing changes: the syncer's periodic call
-commits only when there are changes, file data goes into the tree when
-its pages are written back, and one commit (two device cache flushes)
-takes all of it.
+gefs writes nothing while nothing changes.
+A change is committed once it is
+.Va vfs.gefs.interval
+seconds old, earlier when space runs low, and at once for
+.Xr fsync 2 ,
+.Xr sync 2
+and unmount; file data goes into the tree when the syncer writes its
+pages back, and one commit (two device cache flushes) takes all of it.
+.Xr fsync 2
+calls that wait at the same time share one commit, and none returns
+before its data is on the disk.
 An idle mount does no disk I/O at all; automatic snapshots are taken by
 such commits and only for labels that changed.
+.Pp
+These
+.Xr sysctl 8
+variables apply to every gefs mount:
+.Bl -tag -width vfs.gefs.groupwait
+.It Va vfs.gefs.interval
+Seconds a change may wait for a commit, at most (default 30).
+A longer interval puts more changes into one disk wake-up, and a crash
+loses more of them.
+Data written with
+.Xr write 2
+reaches the tree when the syncer writes its pages back
+.Pq Va kern.syncdelay ,
+so without
+.Xr fsync 2
+it can wait about the interval plus that.
+.It Va vfs.gefs.groupwait
+Microseconds a commit asked for by
+.Xr fsync 2
+waits for more callers to join (default 0).
+.It Va vfs.gefs.dirtypct
+Commit when the blocks queued for writing pass this percentage of the
+block cache (default 0, never).
+.It Va vfs.gefs.commits , skipped , requests , joined
+Commits written, skipped as clean, durability requests, and requests
+that shared another's commit.
+.It Va vfs.gefs.commits_sync , commits_age , commits_dirty , commits_space , commits_lazy
+Commits by reason.
+.It Va vfs.gefs.reads , writes , flushes
+Device block reads and writes, and cache flushes.
+.El
 .Sh EXAMPLES
 Mount the file system, a fork of it for build output, and yesterday's
 snapshot:
