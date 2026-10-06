@@ -105,8 +105,8 @@ context:
   mutator proc disappears.  Upserts are batched per operation as in 9front.
 - One kernel thread per file system does long work (the sweeper's jobs:
   freeing large files after remove or truncate, deleting snapshots, clearing
-  trees) and commits.  It sleeps on a condition variable and runs only when
-  given work.
+  trees) and commits.  It sleeps on a condition variable, with a timeout
+  only while something is waiting to be committed.
 - No task proc.  See the commit schedule below.
 
 * I/O and the write-back queue (power)
@@ -142,10 +142,15 @@ A commit is 9front's =sync()=, unchanged in its ordering, except:
   allocation or free, deadlist or snapshot change; if nothing is dirty the
   commit returns without touching the disk.  (9front's version appends a sync
   barrier to every arena log, so even an idle commit writes.)
-- *Scheduled by NetBSD, not by a timer*: the syncer calls =VFS_SYNC(MNT_LAZY)=
-  on every mounted file system every =syncdelay= seconds (30 by default,
-  the same window FFS uses for metadata), =fsync(2)= and =sync(2)= commit, as
-  does unmount.  With nothing dirty, that call does nothing.
+- *Scheduled by the mutator, bounded, never by a periodic timer*: the
+  mutator thread commits between jobs when asked (=fsync=, =O_SYNC=,
+  =sync(2)=, unmount), when the oldest change in the tree is
+  =vfs.gefs.interval= seconds old (30 by default), when the blocks queued
+  for writing pass =vfs.gefs.dirtypct= of the cache, or when space runs
+  low.  The syncer's =VFS_SYNC(MNT_LAZY)= every =syncdelay= seconds only
+  pushes dirty pages into the tree, counted as dirty since its previous
+  pass.  A clean file system's mutator sleeps with no timeout
+  (GEFSPLUS.org, item 3).
 - Before a commit writes the tree, dirty UBC pages of the file system's vnodes
   are pushed into it (=VOP_PUTPAGES=), so data and metadata go out in one
   burst.
@@ -154,7 +159,10 @@ A commit is 9front's =sync()=, unchanged in its ordering, except:
   idle file system takes none, and the snapshots kept are states that
   differ.  9front's default (=60@m 24@h @d=, dailies kept forever) applies
   to volumes that set none; =newfs_gefs= sets =60@m 24@h 14@d=.
-- =fsync= is a full commit, since gefs has no intent log.
+- =fsync= waits for a full commit, since gefs has no intent log, but one
+  commit serves every =fsync= it covers (group commit: commits are
+  numbered by their cut, and a caller waits for the first durable one that
+  holds its changes; GEFSPLUS.org, item 2).
 
 * File data and UBC
 
@@ -253,8 +261,11 @@ mode as mount options.
   and pkgsrc, crash tests (kill QEMU during writes, remount, fsck), and power
   checks: zero disk writes over minutes on an idle mount, and write bursts no
   more often than the commit schedule while something writes steadily.
+- =tests/fsyncgrp.c=: concurrent fsync loops, commits shared, and with
+  =-a=/=-v= every acknowledged record checked after QEMU is killed;
+  =tests/beat.sh=: commits per phase of a steady small writer, then idle.
 
-* Status (2026-09-28)
+* Status (2026-10-06)
 
 Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
 
@@ -327,6 +338,17 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
   log is its weak point.  Unmount: 76 commits, 97 skipped as clean over
   the session.
 
+- *gefs+ group commit and commit policy (2026-10-06, VM)*: fsyncs that
+  wait at the same time share commits (16 threads each fsyncing 4 KiB
+  records: 8.5 fsyncs per commit and 1735 fsyncs/s, against 1.8 and 665
+  before); the mutator commits a dirty tree once its oldest change is
+  =vfs.gefs.interval= old (30: the same 8 commits in 4 minutes of a log
+  line every 2 s as before; 120: 2) or when space runs low, and sleeps
+  with no timeout when clean.  16 resets during concurrent fsync loops,
+  60961 acknowledged records, none lost.  The tests found an older bug
+  that lost data written with large appending writes (below).  Numbers
+  and method in GEFSPLUS.org.
+
 ** What the implementation taught
 
 - *12 KiB kernel stacks.*  The core's buffers (Kvmax-sized arrays, Scans) and
@@ -366,6 +388,16 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
   after fsx).  Truncation now holds the genfs node lock as FFS does, and
   drops what is left past the end once its I/O is done.  240,000 random
   operations, with and without mmap and remounts, compare equal.
+- *A page write reads the file's size when it runs.*  Write-behind queued
+  the page writes of a window during an extending write(2), while v_size
+  still held the old size; when the mutator ran one before the write set
+  the new size, it dropped the data past the old size and genfs marked the
+  page clean.  The part of a record before a 1 MiB boundary was gone after
+  a remount or a crash.  Found by the fsync crash test (16 threads,
+  40000-byte records, one record lost in one of ten resets); a 20 ms pause
+  injected after the write-behind lost every record across a boundary (7
+  of 200).  Now v_size follows each chunk of the write, as in FFS, and the
+  pagedaemon is sent away from pages past v_size of a write in progress.
 - *KAUTH_SYSTEM_FS_SNAPSHOT is FFS's*: its listener takes the vnode argument
   for an FFS inode, and paniced on a gefs one.  Label changes are authorized
   as mount updates.
@@ -398,6 +430,14 @@ Tested in a NetBSD 11.0 amd64 VM (QEMU/KVM):
 - 9front's dump view; ctime, extended attributes, NFS export (needs a qid
   index), ACLs.
 - Report the wstat truncation bug to Ori.
-- gefs+ (=doc/GEFSPLUS.org=): commits on a beat (longer on battery), an
-  fsync that keeps order and is saved by the next beat, and optionally an
-  intent log (a ZIL) for a durable fsync, all within 9front's format.
+- gefs+ (=doc/GEFSPLUS.org=, reordered 2026-10-06): group commit and the
+  bounded commit policy are done; next, measure them on the laptop with
+  the energy-per-event method there (=vfs.gefs.interval= 120 on battery
+  from powerd), then the snapshot write amplification below.  An intent
+  log only if fsync wake-ups still matter after that; =fsync=order= only
+  as an experiment.
+- Deadlist merging (9front's): each commit moves the deadlists of blocks
+  born before the newest snapshot into the new generation, one per birth
+  generation; after truncating files written over thousands of commits,
+  78 became 2300 block writes per commit (GEFSPLUS.org, 4).  Matters for
+  fsync on a root with snapshots.

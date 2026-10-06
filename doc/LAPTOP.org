@@ -35,13 +35,17 @@ Each step below can be undone, and the FFS root stays until the last one.
   no flushes; compare the drive's time asleep and the battery rate with
   the same hour on FFS.
 - Active: the usual desktop day; watch =vfs.gefs.flushes=.  Each fsync
-  is a commit with two cache flushes (gefs has no intent log), so
-  programs that fsync often cost wake-ups: Firefox's SQLite databases
+  waits for a commit with two cache flushes (gefs has no intent log;
+  fsyncs that wait at the same time share one), so programs that fsync
+  often cost wake-ups: Firefox's SQLite databases
   are the likely one.  If they dominate, keep =~/.mozilla= on FFS, or tune
   Firefox's storage sync (=toolkit.storage.synchronous=).
-- The syncer commits a changed gefs at most every =kern.syncdelay= seconds
-  (30); a longer delay batches more into one commit, at the price of what a
-  crash can lose.
+- A changed gefs commits once its oldest change is =vfs.gefs.interval=
+  seconds old (30; the plan is 120 on battery, set by powerd's
+  =acadapter= script), earlier for fsync, dirty memory or low space
+  (GEFSPLUS.org).  A longer interval batches more into one commit, at the
+  price of what a crash can lose.  =vfs.gefs.commits_*= say why each
+  commit ran.
 
 * 3. Booting from gefs, next to the current setup
 

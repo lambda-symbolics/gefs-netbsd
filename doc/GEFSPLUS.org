@@ -1,11 +1,17 @@
 #+TITLE: gefs+: a frugal gefs that 9front still reads
-#+DATE: 2026-09-28
+#+DATE: 2026-10-06
 
-A plan, not implemented.  gefs+ is this port with a different write policy:
-when the disk is written, what =fsync= waits for, how flushes are issued.
-The format stays 9front's, with one optional extension that 9front ignores,
-so Ori's gefs reads and writes a gefs+ volume and a cleanly unmounted one is
-a plain gefs volume.
+gefs+ is this port with a different write policy: when the disk is
+written, how many =fsync= calls one commit serves, how flushes are issued.
+The format stays 9front's, so Ori's gefs reads and writes a gefs+ volume
+and a cleanly unmounted one is a plain gefs volume.
+
+First written 2026-09-28 (commit 8ceb7d7) around commits on a beat and an
+=fsync= that keeps order without waiting for the disk.  A review on
+2026-10-06 reordered it: =fsync= stays durable, and the first work is to
+make durable =fsync= cheaper (group commit) and to bound the background
+commits by age, memory and space.  Items 2 and 3 below are implemented;
+the rest is plan.
 
 * Why
 
@@ -18,8 +24,8 @@ laptop (LAPTOP.org, nanobsd =docs/power-levers.org=): gefs wrote 1.5-2.5 times
 what FFS with =log,noatime= wrote, and the drive slept 96-99 % of the time
 under both.
 
-Where gefs stands: an idle gefs writes nothing, every commit is one wake-up,
-and every =fsync= is a commit (48 in 4 minutes at one =fsync= per 5 s, twice
+Where gefs stood: an idle gefs writes nothing, every commit is one wake-up,
+and every =fsync= was a commit (48 in 4 minutes at one =fsync= per 5 s, twice
 FFS's wake-ups).
 
 The ceiling is low.  At idle on FFS the drive is awake about 2 % of the time;
@@ -57,80 +63,250 @@ data block), another block size (=Lgblk= 14 is compiled in), compression, new
 message ops or key kinds in the trees.  They would cut writes, not wake-ups,
 so they would not help the battery anyway.
 
-* 1. One commit clock
+Items 2 and 3 change nothing on the disk: when commits happen, not what
+they write.
 
-Today the syncer calls =VFS_SYNC= every =syncdelay= (30 s); =gefs_sync= pushes
-dirty pages into the tree (memory only) and commits if anything is dirty;
-=fsync=, =sync(2)= and unmount commit too.
+* Priorities (2026-10-06)
 
-gefs+ commits on a beat of =vfs.gefs.interval= seconds (30 on AC, 120 on
-battery, set from powerd's =acadapter= script), and at once for =sync(2)=,
-=gefs sync=, unmount, =MNT_WAIT= syncs (shutdown), memory pressure (the queue's
-high-water mark, blk.c) and before suspend (the lid script would run =sync=
-before =hw.acpi.sleep.freeze=1=; the freeze stops userland, so nothing new
-gets dirty).  =gefs_sync= still pushes pages into the tree on every syncer
-pass; only the commit waits for the beat.
+1. =fsync= stays durable by default.  Order-only =fsync= is at most an
+   experimental mount option (below).
+2. Durable group commit: one commit serves every =fsync= it covers.
+   Done.
+3. Background commits bounded by dirty age, dirty memory and space, with
+   explicit durability requests overriding them and a clean file system
+   doing nothing.  Done; committing for dirty memory measured as a loss
+   and is off by default (below).
+4. Housekeeping (snapshot schedules, deferred frees) rides with commits
+   that happen anyway.  Mostly so already, measured; see below, also for
+   the deadlist cost found on the way.
+5. An intent log only after 2-4 are measured on the laptop.  FUA for the
+   superblock later still.
+6. Measurement: commits, flushes and writes per workload (=vfs.gefs.*=),
+   and energy per event on the laptop.
 
-Between beats nothing reaches the drive, however many programs write.  FFS
-works differently: each vnode is flushed on its own timer (=filedelay=,
-=dirdelay=, =metadelay=), the journal on the syncer's per-mount pass, so
-writes made at different moments wake the drive at different moments.
-Linux's =laptop_mode= does the same batching for in-place file systems, and
-NetBSD's syncer could get one, but FFS would still owe every =fsync= its own
-flush.
+The reason for the order: 2 and 3 keep every promise an application gets
+today and take wake-ups away where several things wait at once; =fsync=order=
+takes them away by changing what =fsync= promises, which is a different
+kind of change and needs a proof this port does not have yet.
 
-Costs: a crash (panic, hard power-off) loses up to one beat of work, and more
-dirty data sits in memory, which makes the dirty-page space reservation in
-DESIGN.org "Next" matter more (today a 64 MiB =ENOSPC= margin).
+* 1. fsync stays durable; fsync=order only as an experiment
 
-Size: small (a sysctl, a check in =gefs_sync=, a powerd script line).
+=fsync= returns once its data is on the disk, on every mount, and so do
+=O_SYNC=/=O_DSYNC= writes, =sync(2)= with =MNT_WAIT= (shutdown) and unmount.
 
-* 2. fsync that keeps order
+The 2026-09-28 plan had =-o fsync=order=: =fsync= pushes the file's pages
+into the tree and returns, and the next commit makes them durable; after a
+crash the disk is an earlier cut of the same order, never a reordering.  If
+it is ever built, it is an explicitly experimental mount option, never a
+default, documented as changing the application contract (an acknowledged
+=fsync= can be lost).  Before it can even claim "order is kept", these have
+to be shown, by argument and by targeted crash tests, not assumed:
 
-Today =gefs_fsync= pushes the file's pages into the tree (=VOP_PUTPAGES= with
-=PGO_SYNCIO=) and commits.  gefs+ with =-o fsync=order= does the same push and
-no commit; the next beat makes it durable.
+- UBC and dirty pages: every page an =fsync= covers is in the tree when it
+  returns, including pages under write-behind or the pagedaemon at that
+  moment.  genfs skips busy pages in a synchronous =putpages= and waits on
+  =v_numoutput= instead; a page marked busy whose I/O is not yet issued is a
+  window to rule out.
+- mmap: stores through a mapping reach the tree only when the page is put;
+  =msync= and =fsync= order against later =write(2)= calls has to hold.
+- Truncate: a truncation and the writes after it enter the tree in call
+  order, and a crash cannot show old data past the new end (the 2026-09
+  truncation bugs were exactly this kind).
+- Rename: rename-over without =fsync= (the "replace a file" idiom) needs the
+  source's data in the tree before the rename enters it, or a crash can
+  show an empty file (ext4's =auto_da_alloc=).
+- Concurrent writers: two threads writing one file, or one writing while
+  another fsyncs, enter the tree in an order a program could have
+  observed.
 
-Why it is safe:
-- Every change enters the tree in one serial order, under =fs->mutlk=.
-  Creates, renames, removes and attribute changes enter when the call is
-  made.  File data enters when its pages are pushed, as jobs on the
-  mutator's queue, which calls =biodone= only once the data is in the tree.
-- A commit writes a cut of that order, atomically.
-- When =fsync(A)= returns, A's data is in the tree, so any later write, to any
-  file, enters after it: no commit can hold the later write without A.
-- After a crash the disk is the last commit, in the order programs asked for.
-  They lose their latest changes, not their consistency.  SQLite (Firefox's
-  databases) needs exactly this, since its WAL checksums catch a torn tail,
-  and git's object-then-ref order holds.  On FFS the same shortcut can
-  corrupt a database, since data is written in place, in no particular order.
+No claim of SQLite or Git safety without crash tests of them (an SQLite
+counter loop with =PRAGMA integrity_check= after each reset, a git commit
+loop with =git fsck=), on top of the order test (=write(A); fsync(A);
+write(B)=; B never ahead of A).
 
-Unlike ZFS's =sync=disabled=, the push stays: UBC holds file data outside the
-tree, so without it a later write could reach a commit before an earlier
+* 2. Durable group commit (implemented)
+
+Each =fsync=, =O_SYNC= write and waiting =sync= needs a particular commit
+to be durable, and one commit that holds several callers' changes serves
+them all:
+
+- Commits are numbered by their cut: the moment pass 0 of =fssync= takes
+  the trees, under =mutlk= (=fs->cmtcut=).  =fs->cmtdone= is the last cut
+  whose headers and superblocks are flushed.
+- A caller first puts its pages into the tree, then asks the mutator what
+  it needs: the commit after the last cut if the tree is dirty, else the
+  last cut.  The question is a job on the mutator queue, so the caller's
+  page writes (queued before it) are in, and no commit is running then.
+- If that commit is already durable, the caller returns.  Otherwise it
+  waits for =cmtdone= to reach its number.  A caller whose changes made it
+  into the commit in progress waits for that one; a caller whose changes
+  came after its cut waits for the next, which one request starts and
+  every later caller joins.
+- The requested commit runs once the jobs queued before the request are
+  done, so page writes that other callers queued meanwhile go into it too.
+  =vfs.gefs.groupwait= (microseconds, default 0) can hold it back longer,
+  for more callers to join; when the mutator has nothing else to do that
+  wait rounds up to a clock tick (10 ms at =HZ= 100).
+- A failed commit, or one that cannot cover the callers (the file system
+  broke and went read-only), fails every waiter with its error (EIO,
+  EROFS), where =fsync= used to return 0.
+
+Measured in the VM (=tests/fsyncgrp.c=: N threads, each writing a 4 KiB
+record to its own file and fsyncing, 10 s each, one fresh 4 GB volume per
+module with =retain none= (see 4 for why); a virtio disk with the host's
+write-back cache, so a flush is an =fdatasync= on the host and latencies
+are the host's, not an SSD's).  Before is the module built from 8ceb7d7:
+
+| threads | before: fsyncs/s | fsyncs per commit | p50 ms | after: fsyncs/s | fsyncs per commit | p50 ms |
+|---------+------------------+-------------------+--------+-----------------+-------------------+--------|
+|       1 |              405 |              1.00 |    2.1 |             394 |              1.00 |    2.1 |
+|       2 |              514 |              1.80 |    2.2 |             739 |              1.92 |    2.2 |
+|       4 |              725 |              1.81 |    4.5 |             931 |              2.41 |    4.1 |
+|       8 |              656 |              1.76 |   11.3 |            1016 |              4.79 |    6.3 |
+|      16 |              665 |              1.77 |   22.4 |            1735 |              8.54 |    8.2 |
+
+At 16 threads: 2032 commits and 4064 flushes for 17361 fsyncs, against
+3766 and 7532 for 6666.  "Before" already shared commits by accident: an
+fsync whose commit job found the tree clean skipped it, which caps at
+about 2.  With group commit the share grows with the callers waiting:
+those that arrive during a commit share the next one.
+
+A batching window helps only under load.  With =groupwait= 2000 (in
+practice a 10 ms tick when the mutator has nothing else to do): 16
+threads, 15.9 fsyncs per commit, 904/s, p50 17 ms, a quarter of the
+commits of no window; one thread, 78/s instead of 394, since every fsync
+waits the tick.  10000: 15.9 per commit, 541/s, p50 28 ms; one thread
+42/s.  The default stays 0: on a laptop fsyncs rarely come together,
+and a window would tax every lone one.
+
+Crash test (=fsyncgrp -a= streams "ack t i" to the host after each fsync
+returns; QEMU is killed 5-20 s in; after the reboot every acknowledged
+record must be there and the volume must check clean): 16 resets (8
+threads with 4 KiB records; 16 threads with 40000-byte records, with and
+without =groupwait= 2000; 4 threads with =interval= 120 and =dirtypct=
+1), 60961
+acknowledged records, none lost, every check clean.  QEMU's process dies
+but the host's page cache does not, so this shows that the guest had
+issued and completed every write and flush before =fsync= returned, not
+that a disk honours its flushes.
+
+The first series of resets lost one record (one of ten resets): a
+40000-byte record across a 1 MiB boundary.  The cause was older than
+group commit and worse than a crash: write-behind queued the page writes
+of a window while an extending write(2) had not yet moved v_size, and a
+page write that ran first dropped the data past the old size and left the
+page clean.  A plain =dd bs=1m= of 300 MB of random data to the 8ceb7d7
+module read back 163 MB different after a remount, and 0 after the fix
+(v_size follows each chunk of the write, as in FFS; DESIGN.org).
+
+* 3. Background commits: bounded by age, memory and space (implemented)
+
+The mutator thread decides, between jobs:
+
+- *Requests* (above) first.
+- *Age*: a dirty tree is committed when its oldest change is
+  =vfs.gefs.interval= seconds old (default 30).  The interval is a
+  maximum, not a beat: anything below commits earlier.
+- *Dirty memory*: optional, off by default.  =vfs.gefs.dirtypct= > 0
+  commits when the blocks queued for writing pass that percent of the
+  block cache.  Measured, it is not worth it: with 25 (16 MiB of the
+  default 64 MiB cache) a 1.5 GB =dd= ran 145 commits and 290 flushes
+  instead of 1 and 2, wrote 8 % more blocks and took 8.8-10 s instead of
+  6.4; with 50, 74 commits and 7.1 s.  Memory does not need a commit: a
+  full queue, or a cache out of clean blocks, is drained (written, no
+  flush), and that bounds it.  The page cache is bounded by the syncer
+  and write-behind, as before.  What a commit does bring back is space
+  (below).
+- *Space*: when the space outside the reserve falls below 128 MiB, or half
+  the reserve is gone, at most once a second: what was freed since the
+  last commit is free only after one.  A 4 GB volume filled by =dd= to
+  ENOSPC, emptied with =rm= and filled with 2 GB again took 2 such
+  commits, and checks clean.
+- *Lazy updates* alone (atime, frees a commit leaves for the next one)
+  after =Lazymax= (300 s), as before.
+- A clean file system: the mutator sleeps with no timeout.  It only sleeps
+  with one while something is dirty.
+
+The syncer still pushes dirty pages into the tree every =kern.syncdelay=
+(30 s), and the commit no longer follows at once: the pages count as
+dirty since the syncer's previous pass, so with the default interval the
+syncer's pass commits as before, and a longer one delays the commit.
+Metadata changes enter the tree when they are made; =write(2)= data enters
+it at the syncer's pass, or at once for writes bigger than the 1 MiB
+write-behind window.  So a change made without =fsync= reaches the disk
+within =interval= (metadata) or about =interval= + =syncdelay= (data), at
+worst.  =sync(2)= asks for a commit now; shutdown and unmount wait for
 one.
 
-Kept strict: =O_SYNC= and =O_DSYNC= writes, =MNT_SYNCHRONOUS= mounts, =sync(2)=,
-and every mount without the option, so a mail spool or a VM image can keep
-the full commit.
+Counters: =vfs.gefs.commits_{sync,age,dirty,space,lazy}= (why the mutator
+committed), =requests= and =joined= (durability requests, and those that
+started no commit of their own), besides =commits=, =skipped=, =writes=,
+=flushes=.
 
-With the option, a rename over an existing file first pushes the source's
-pages into the tree (ext4's =auto_da_alloc=).  Programs that rename without
-=fsync= then find no empty files after a crash.  It is cheap, memory only.
+On the laptop =powerd='s =acadapter= script would set the interval: 30 on
+AC, 120 on battery.  Not done: the laptop is not touched from here.
 
-Tests in the VM:
-- A writer does =write(A, n); fsync(A); write(B, n)= in a loop, with hard
-  resets (=ddb-reboot.sh=) at random; B must never be ahead of A.
-- An SQLite counter loop, with =PRAGMA integrity_check= after every reset.
-- A git commit loop, with =git fsck= after every reset.
+Measured in the VM (=tests/beat.sh=: a log line every 2 s, a file made and
+removed every 10 s, no fsync, 4 minutes, then 150 s idle; fresh volume,
+default retention):
 
-Precedents: OptFS's =osync= (Chidambaram et al., "Optimistic Crash
-Consistency", SOSP 2013); ZFS's =sync=disabled=.
+| module          | active: commits | flushes | writes | idle: commits | skipped syncer calls |
+|-----------------+-----------------+---------+--------+---------------+----------------------|
+| 8ceb7d7         |               8 |      16 |    476 |             1 |                    4 |
+| interval 30     |               8 |      16 |    476 |             1 |                    0 |
+| interval 120    |               2 |       4 |    120 |             1 |                    0 |
 
-Size: small.
+The default keeps the old behaviour exactly; 120 s takes three quarters
+of the wake-ups away for this load (each commit here is about 60 block
+writes and 2 flushes).  The idle commit is the last change's own, one
+interval after it.
 
-* 3. Intent log, optional
+* 4. Housekeeping with the commits that happen anyway
 
-For mounts that need durable =fsync= without a whole commit.
+Mostly so already, and measured: automatic snapshots are taken only inside
+commits and only after changes; the frees of pruned snapshots (a sweep
+after the commit that deleted them) and atime ride with the next commit,
+and alone go out only after =Lazymax= (300 s).  With =retain 2@m= (a minute
+snapshot taken and one pruned in every active minute) =beat.sh= ran 8
+commits in its 4 active minutes, as without pruning, and in 330 s idle the
+last change's age commit and one lazy commit 300 s later, which carried
+the pruned snapshots' frees and the minute snapshot of the last changes.
+So pruning adds no commit while anything else commits, and one per idle
+period otherwise.
+
+Left:
+
+- When a sweep leaves a snapshot's predecessor unreferenced it deletes
+  that too, and the snap tree is dirty (9front's tree code marks it), so
+  that commit comes after the interval, not after =Lazymax=.  Rare with
+  schedules, whose predecessors are labelled snapshots.
+- On battery =Lazymax= could be longer, or follow the interval.  It bounds
+  what a crash leaks: frees not yet committed are lost with it, and
+  9front's check does not look for leaked blocks.  A trade of space for
+  wake-ups, to decide with the laptop's numbers.
+
+Found while measuring, and bigger than any of this: deadlist merging.
+Every commit deletes the label's previous, unlabelled generation, and
+=reclaimblocks= moves that generation's deadlists for blocks born before
+the newest snapshot into the new generation: two snap-tree messages per
+deadlist (and a synchronous write of a tail block when the target already
+exists).  There is one deadlist per birth generation, so the work per
+commit is the number of distinct birth generations among the blocks
+killed since the newest snapshot; a new snapshot keeps the deadlists it
+has, which resets the count.  =fsyncgrp= truncating its 16 files, written
+over a few thousand commits, makes thousands: with one snapshot of main,
+78 became about 2300 block writes per commit and 1850 fsyncs/s became 120;
+deleting the snapshot brought it back.  A big truncation or =rm= of old
+data under a long-lived newest snapshot is the bad case; frequent
+snapshots keep it small.  It is 9front's algorithm, and a fix changes
+which deadlists exist, which 9front must still read correctly.  To look
+into before a gefs root on battery; this is also why the benchmarks in 2
+use =retain none=.
+
+* 5. Intent log, after measuring 2-4
+
+For mounts that need many durable =fsync= calls without a whole commit
+each, if group commit and the policy are not enough on the laptop.
 
 - Space: one fixed extent (say 4 MiB), allocated once through the normal
   allocator, so both implementations see it as used.  No tree refers to it.
@@ -140,51 +316,63 @@ For mounts that need durable =fsync= without a whole commit.
   they follow; sequence number; length; payload hash), then the tree
   messages of the fsynced operations.  Small writes carry their data inline.
   Big ones point at data blocks written to newly allocated places, which
-  replay marks allocated again.  =fsync= appends records and flushes once (or
-  uses FUA).
+  replay marks allocated again.  =fsync= appends records and flushes once.
 - Reset for free: a commit changes the superblock hash, so every record
-  before it stops matching and nothing needs writing to empty the log.  A
-  full extent forces a commit.
-- Replay (gefs+ only, at mount): from the start of the extent, apply records
-  through the normal upsert path while magic, stamp, sequence and hash all
-  match, then commit.
-- With 9front: after a clean unmount the log is stale and the disk is plain
-  gefs.  After a crash, if 9front mounts first it sees the last commit and
-  loses only the logged seconds.  Once it commits, the stamps cannot match
-  and gefs+ ignores the old records.  The data blocks of big logged writes
-  were never committed as allocated, so 9front just reuses them.  The boot
-  loader reads the last commit and ignores the log.
+  before it stops matching.  A full extent forces a commit.
+- Replay (gefs+ only, at mount): apply records through the normal upsert
+  path while magic, stamp, sequence and hash all match, then commit.
 
-Power: one wake-up per =fsync=, as on FFS.  It buys durability, not battery.
-Size: the biggest piece (format, write path, replay, crash tests).
+Compatibility, stated honestly: after a clean unmount the log is stale and
+the disk is plain gefs.  After a crash it is not crash-equivalent: if 9front
+(or the boot loader) mounts first, it ignores the log and sees the last
+commit, so it loses operations gefs+ acknowledged as durable.  Once 9front
+commits, the stamps no longer match and gefs+ ignores the old records too.
+The interop promise is clean-unmount compatibility only.
 
-* 4. Small things
+Power: one wake-up per =fsync= (or per group), as on FFS.  It buys
+latency, not battery.  The biggest piece of work (format, write path,
+replay, crash tests).
 
-- One flush per commit: write the superblocks with =B_MEDIA_FUA= where the
-  disk reports =DKCACHE_FUA=, instead of the second =DIOCCACHESYNC=.  ld_nvme
-  passes FUA through; WAPBL has it behind =vfs.wapbl.allow_dpofua=.  It saves
-  milliseconds per wake-up, so it comes last.
-- Lazy commits (atime, deferred frees) already ride along with the next
-  commit, and happen alone at most every =Lazymax= (300 s).  On battery,
-  =Lazymax= could follow the beat.
+FUA superblocks (=B_MEDIA_FUA= where the disk reports =DKCACHE_FUA=,
+instead of the second =DIOCCACHESYNC=) come after that, and must keep the
+order the second flush gives today: every new data and tree block, and the
+arena headers, durable before the superblock that points at them is.
+FUA on the superblock write alone does not give that; the flush before it
+stays.
 
-* Expected gain and measuring it
+* 6. Measuring
 
-As the root, with a 2-minute beat and =fsync=order=, the file system would
-wake the drive at most once per 2 minutes, Firefox or not.  The SSD would
-sleep about 99.8 % of the time instead of about 98 %: tens of mW (estimate),
-about 1 % of the idle draw.  That makes gefs a little better than FFS
-instead of a little worse.  Worth doing if gefs becomes the root for its
-snapshots and boot environments; not for power alone.
+Counts, per workload: =vfs.gefs.*= before and after (commits by reason,
+skipped, requests, joined, writes, flushes), and the drive's own counters
+(=iostat=, =nvmectl power=).  The VM can give counts and latencies only:
+its disk is a file on the host, and nothing there says what a wake-up
+costs.
 
-Measuring: runs like the ones in LAPTOP.org (=iostat -x -w 1=, =nvmectl power=
-every 0.5 s) with no remote logins during a run, plus watts from =envstat='s
-discharge rate on battery (=apst-ab='s method), at least 30 minutes per
-setting.  Compare the FFS root, a gefs root (beat 30 s, =fsync= commits) and
-gefs+ (beat 120 s, =fsync=order=).
+Energy per event, on the laptop, on battery:
+
+- E_event = ∫ (P_event - P_quiet) dt over a long run, divided by the
+  number of events (commits, flushes) the counters say happened in it.
+- P_quiet: the same duration with the same session and the workload
+  stopped, measured just before and after, to catch drift.
+- Power from the battery's discharge rate (=envstat=), read only at the
+  start and the end of a run (charge in mWh, the integral), never polled
+  during it: polling over ssh is itself a workload (the 2026-09-28 runs
+  showed this).  Counters likewise read only before and after.
+- Runs long enough for the battery's reported charge to resolve the
+  difference: at least 30 minutes each, alternated (quiet, event, quiet,
+  ...), several of each.
+- Events at a controlled rate (e.g. =fsyncgrp= at a fixed period, or
+  =beat.sh=) so that E_event × rate can be compared with the measured
+  difference in mean power.
+
+What this gives: mJ per commit with APST on, the number that says whether
+group commit, a longer interval or an intent log is worth anything on the
+battery.
 
 * Order
 
-1, then 2 with the VM tests.  Then measure on the laptop against FFS; a gefs
-label mounted as =/home= is enough to try, the root can come later.  3 only
-where 2's trade is unacceptable.  4 whenever.
+2 and 3 (done), then measure them on the laptop against FFS with the
+energy method above; a gefs label mounted as =/home= is enough to try.
+The deadlist cost in 4 next, then 4's open points.  5 only if the
+measurements say =fsync= wake-ups still matter; =fsync=order= only as an
+experiment with its proof obligations met.
