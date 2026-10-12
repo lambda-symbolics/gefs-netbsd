@@ -123,6 +123,8 @@ gefs_sysctl_init(void)
 		    &gefs_groupwait },
 		{ "dirtypct", "commit when queued blocks pass this % of the cache (0: off)",
 		    &gefs_dirtypct },
+		{ "lazymax", "seconds atime and deferred frees may wait alone for a commit",
+		    &gefs_lazymax },
 	};
 	const struct sysctlnode *node;
 	int i;

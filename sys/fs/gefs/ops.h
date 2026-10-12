@@ -40,7 +40,8 @@ enum {
 enum {
 	Clazy	= 1<<0,		/* also when only lazy updates are pending */
 };
-#define Lazymax	(300LL*Nsec)	/* lazy updates wait at most this long */
+extern int gefs_lazymax;	/* vfs.gefs.lazymax, seconds */
+#define Lazymax	((vlong)gefs_lazymax*Nsec)	/* lazy updates wait at most this long */
 
 /* file types */
 enum {

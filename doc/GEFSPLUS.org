@@ -283,7 +283,9 @@ Left:
 - On battery =Lazymax= could be longer, or follow the interval.  It bounds
   what a crash leaks: frees not yet committed are lost with it, and
   9front's check does not look for leaked blocks.  A trade of space for
-  wake-ups, to decide with the laptop's numbers.
+  wake-ups, to decide with the laptop's numbers.  2026-10-13: it is
+  =vfs.gefs.lazymax= (seconds, default 300), so the battery policy that
+  sets =vfs.gefs.interval= can set it too.
 
 Found while measuring, and bigger than any of this: deadlist merging.
 Every commit deletes the label's previous, unlabelled generation, and

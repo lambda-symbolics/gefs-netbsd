@@ -25,6 +25,9 @@
 #include "fns.h"
 #include "ops.h"
 
+/* how long atime and deferred frees may wait alone, s (vfs.gefs.lazymax) */
+int gefs_lazymax = 300;
+
 static void
 wrbarrier(void)
 {

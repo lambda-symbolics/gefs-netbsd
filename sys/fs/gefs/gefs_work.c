@@ -173,7 +173,7 @@ gefs_thread(struct gefsdev *gd, struct gefsjobq *q, kcondvar_t *cv)
  * Background: a dirty tree is committed when its oldest change is
  * vfs.gefs.interval seconds old, earlier when the space outside the
  * reserve runs low (at most once a second), and lazy updates alone go
- * out after Lazymax.  vfs.gefs.dirtypct, off by default, also commits
+ * out after vfs.gefs.lazymax.  vfs.gefs.dirtypct, off by default, also commits
  * when the blocks queued for writing pass that percent of the block
  * cache; memory does not need it (a full queue or cache is drained, which
  * writes without a commit), and with 25 a 1.5 GB dd took 145 commits and

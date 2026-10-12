@@ -91,6 +91,13 @@ waits for more callers to join (default 0).
 .It Va vfs.gefs.dirtypct
 Commit when the blocks queued for writing pass this percentage of the
 block cache (default 0, never).
+.It Va vfs.gefs.lazymax
+Seconds that access times and the frees a commit leaves for the next one
+may wait alone for a commit (default 300).
+They ride with any other commit; this bounds what a crash leaks
+when nothing else changes, so on battery it can follow
+.Va vfs.gefs.interval
+upwards.
 .It Va vfs.gefs.commits , skipped , requests , joined
 Commits written, skipped as clean, durability requests, and requests
 that shared another's commit.

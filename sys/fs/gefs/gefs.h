@@ -177,7 +177,7 @@ void	gefs_queuebuf(struct gefsmount *, struct vnode *, struct buf *);
 int	gefs_durable(struct gefsmount *, int);
 void	gefs_cmtrequest(struct gefsmount *, int);
 void	gefs_kick(struct gefsdev *);
-extern int	gefs_interval, gefs_groupwait, gefs_dirtypct;
+extern int	gefs_interval, gefs_groupwait, gefs_dirtypct, gefs_lazymax;
 
 /* gefs_vfsops.c */
 extern int	gefs_trace;
