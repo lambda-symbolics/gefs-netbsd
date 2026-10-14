@@ -238,7 +238,7 @@ gefs_freefs(Gefs *f)
 	for(i = 0; i < f->cmax; i++)
 		free(f->blkall[i]);
 	free(f->blkall);
-	for(i = 0; i < f->narena; i++){
+	for(i = 0; f->arenas != nil && i < f->narena; i++){
 		a = &f->arenas[i];
 		if(a->free != nil){
 			for(r = (Arange*)avlmin(a->free); r != nil; r = nr){
@@ -763,6 +763,7 @@ gefs_putall(struct mount *mp, int wait)
 {
 	struct vnode_iterator *marker;
 	struct vnode *vp;
+	int error, firsterror = 0;
 
 	vfs_vnode_iterator_init(mp, &marker);
 	while((vp = vfs_vnode_iterator_next(marker, gefs_sync_selector, NULL)) != NULL){
@@ -771,12 +772,16 @@ gefs_putall(struct mount *mp, int wait)
 			continue;
 		}
 		rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
-		(void)VOP_PUTPAGES(vp, 0, 0, PGO_ALLPAGES | PGO_CLEANIT |
+		error = VOP_PUTPAGES(vp, 0, 0, PGO_ALLPAGES | PGO_CLEANIT |
 		    (wait ? PGO_SYNCIO : 0));
+		if(error == 0 && wait && VTOGN(vp) != NULL)
+			error = VTOGN(vp)->gn_werror;
+		if(firsterror == 0)
+			firsterror = error;
 		vput(vp);
 	}
 	vfs_vnode_iterator_destroy(marker);
-	return 0;
+	return firsterror;
 }
 
 /*
@@ -791,11 +796,14 @@ gefs_sync(struct mount *mp, int waitfor, kauth_cred_t cred)
 	struct gefsmount *gm = VFSTOGEFS(mp);
 
 	struct gefsdev *gd = gm->gm_gd;
+	int error;
 
 	if(gm->gm_ronly)
 		return 0;
-	/* data only, not waiting for busy vnodes: the commit follows once */
-	gefs_putall(mp, 0);
+	/* A durable sync must wait for busy vnodes and their page writes. */
+	error = gefs_putall(mp, waitfor == MNT_WAIT);
+	if(error != 0)
+		return error;
 	/*
 	 * The page writes above are queued on the mutator; a commit goes
 	 * after them.  The syncer's pass leaves the commit to the background

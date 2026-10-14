@@ -509,14 +509,20 @@ gefs_work_start(struct gefsdev *gd)
 	error = kthread_create(PRI_NONE, KTHREAD_MPSAFE, NULL, gefs_mutator,
 	    gd, NULL, "gefsmut");
 	if(error)
-		return error;
+		goto fail;
 	gd->gd_nthreads++;
 	for(i = 0; i < GEFS_NREADERS; i++){
-		if(kthread_create(PRI_NONE, KTHREAD_MPSAFE, NULL, gefs_reader,
-		    gd, NULL, "gefsrd") == 0)
-			gd->gd_nthreads++;
+		error = kthread_create(PRI_NONE, KTHREAD_MPSAFE, NULL, gefs_reader,
+		    gd, NULL, "gefsrd");
+		if(error)
+			goto fail;
+		gd->gd_nthreads++;
 	}
 	return 0;
+fail:
+	/* Drain started workers and destroy even a wholly unstarted queue. */
+	gefs_work_stop(gd);
+	return error;
 }
 
 void
