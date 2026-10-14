@@ -6,16 +6,29 @@
 #include "dat.h"
 #include "fns.h"
 
+static void
+packbad(void)
+{
+	error("%s", Ecorrupt);
+}
+
+static void
+packneed(char *p, char *e, ulong n)
+{
+	if(p > e || n > (ulong)(e-p))
+		packbad();
+}
+
 /* Terminated so we can use them directly in C */
 char*
 unpackstr(char *p, char *e, char **s)
 {
-	int n;
+	uint n;
 
-	assert(e - p >= 3);
+	packneed(p, e, 3);
 	n = UNPACK16(p);
-	if(e - p < n + 3 || p[n+2] != 0)
-		broke(Efs);
+	if(n > (ulong)(e-p-3) || p[n+2] != 0)
+		packbad();
 	*s = p+2;
 	return p+3+n;
 }
@@ -66,13 +79,17 @@ unpackdkey(char *p, int sz, vlong *up)
 {
 	char key, *ep, *name;
 
+	if(sz < 12)
+		packbad();
 	ep = p + sz;
-	assert(sz > 9);
+	packneed(p, ep, 9);
 	key = UNPACK8(p);	p += 1;
 	*up = UNPACK64(p);	p += 8;
-	assert(key == Kent);
+	if(key != Kent)
+		packbad();
 	p = unpackstr(p, ep, &name);
-	assert(p <= ep);
+	if(p != ep)
+		packbad();
 	return name;
 }
 
@@ -119,6 +136,8 @@ dval2dir(char *v, int nv, Xdir *d)
 	char *v0;
 
 	v0 = v;
+	if(nv != Xdirsz && nv != Xdirsz+8)
+		packbad();
 	d->flag 	= UNPACK64(v);	v += 8;
 	d->qid.path	= UNPACK64(v);	v += 8;
 	d->qid.vers	= UNPACK32(v);	v += 4;
@@ -134,23 +153,25 @@ dval2dir(char *v, int nv, Xdir *d)
 		d->devt	= UNPACK32(v);	v += 4;
 		d->rdev	= UNPACK32(v);	v += 4;
 	}
-	assert(v - v0 == nv);
+	if(v - v0 != nv)
+		packbad();
 }
 
 void
 kv2dir(Kvp *kv, Xdir *d)
 {
 	char *v;
+	vlong up;
 
 	memset(d, 0, sizeof(Xdir));
 	/*
 	 * NetBSD: entries are always Xdirsz here, as on 9front; Ori's
 	 * OpenBSD port appends devt[4] rdev[4] to device nodes, read too.
 	 */
-	if(kv->nk < 9 || (kv->nv != Xdirsz && kv->nv != Xdirsz+8))
-		broke(Efs);
+	if(kv->nk < 12 || (kv->nv != Xdirsz && kv->nv != Xdirsz+8))
+		packbad();
 
-	unpackstr(kv->k + 9, kv->k + kv->nk, &d->name);
+	d->name = unpackdkey(kv->k, kv->nk, &up);
 
 	v = kv->v;
 	d->flag 	= UNPACK64(v);	v += 8;
@@ -168,7 +189,8 @@ kv2dir(Kvp *kv, Xdir *d)
 		d->devt	= UNPACK32(v);	v += 4;
 		d->rdev	= UNPACK32(v);	v += 4;
 	}
-	assert(v - kv->v == kv->nv);
+	if(v - kv->v != kv->nv)
+		packbad();
 }
 
 int
@@ -242,11 +264,14 @@ kv2qid(Kvp *kv, Qid *q)
 {
 	char *v, *e;
 
+	if(kv->nv != 16)
+		packbad();
 	v = kv->v;
 	e = v + kv->nv;
 	q->path = UNPACK64(v);	v += 8;
 	q->vers = UNPACK64(v);	v += 8;
-	assert(v <= e);
+	if(v != e)
+		packbad();
 }
 
 void
@@ -254,6 +279,8 @@ kv2dlist(Kvp *kv, Dlist *dl)
 {
 	char *p, *e;
 
+	if(kv->nk != Dlksz || kv->nv != Dlvsz)
+		packbad();
 	p = kv->k;
 	e = p + kv->nk;
 	p++;
@@ -385,7 +412,9 @@ unpackbp(char *p, int sz)
 {
 	Bptr bp;
 
-	assert(sz >= Ptrsz);
+	if(sz < Ptrsz)
+		packbad();
+	packneed(p, p+sz, Ptrsz);
 	bp.addr = UNPACK64(p);	p += 8;
 	bp.hash = UNPACK64(p);	p += 8;
 	bp.gen = UNPACK64(p);
@@ -395,7 +424,9 @@ unpackbp(char *p, int sz)
 Tree*
 unpacktree(Tree *t, char *p, int sz)
 {
-	assert(sz >= Treesz);
+	if(sz < Treesz)
+		packbad();
+	packneed(p, p+sz, Treesz);
 	memset(t, 0, sizeof(Tree));
 	t->nref = UNPACK32(p);		p += 4;
 	t->nlbl = UNPACK32(p);		p += 4;
@@ -450,7 +481,9 @@ unpackarena(Arena *a, char *p, int sz)
 {
 	char *e;
 
-	assert(sz >= Arenasz);
+	if(sz < Arenasz)
+		packbad();
+	packneed(p, p+sz, Arenasz);
 	memset(a, 0, sizeof(*a));
 
 	e = p + Arenasz;
@@ -508,45 +541,57 @@ unpacksb(Gefs *fi, char *p0, int sz)
 {
 	vlong qgen;
 	uvlong dh, xh;
-	char *p;
+	uint blksz, bufspc, narena;
+	char *p, *e;
 	int i;
 
-	assert(sz == Blksz);
+	if(sz != Blksz)
+		packbad();
 	p = p0;
+	e = p0 + sz;
+	packneed(p, e, 112);
 	if(memcmp(p, "gefs9.00", 8) != 0)
 		error("%s %.8s", Efsvers, p);
 	p += 8;
-	fi->blksz = UNPACK32(p);		p += 4;
-	fi->bufspc = UNPACK32(p);		p += 4;
-	fi->narena = UNPACK32(p);		p += 4;
-	fi->snap.ht = UNPACK32(p);		p += 4;
-	fi->snap.bp.addr = UNPACK64(p);		p += 8;
-	fi->snap.bp.hash = UNPACK64(p);		p += 8;
-	fi->snap.bp.gen = -1;			p += 0;
-	fi->snapdl.hd.addr = UNPACK64(p);	p += 8;
-	fi->snapdl.hd.hash = UNPACK64(p);	p += 8;
-	fi->snapdl.hd.gen = -1;			p += 0;
-	fi->snapdl.gen = -1;			p += 0;
-	fi->snapdl.tl.addr = UNPACK64(p);	p += 8;
-	fi->snapdl.tl.hash = UNPACK64(p);	p += 8;
-	fi->snapdl.tl.gen = -1;			p += 0;
-	fi->snapdl.gen = -1;			p += 0;
-	fi->flag = UNPACK64(p);			p += 8;
-	fi->nextqid = UNPACK64(p);		p += 8;
-	fi->nextgen = UNPACK64(p);		p += 8;
-	qgen = UNPACK64(p);			p += 8;
-	aswapv(&fs->qgen, qgen);
-	fi->arenabp = emalloc(fi->narena * sizeof(Bptr), 0);
-	for(i = 0; i < fi->narena; i++){
-		fi->arenabp[i].addr = UNPACK64(p);	p += 8;
-		fi->arenabp[i].hash = UNPACK64(p);	p += 8;
-		fi->arenabp[i].gen = -1;
-	}
-	xh = bufhash(p0, p - p0);
-	dh = UNPACK64(p);			p += 8;
+	blksz = UNPACK32(p); p += 4;
+	bufspc = UNPACK32(p); p += 4;
+	narena = UNPACK32(p); p += 4;
+	/* NetBSD: bound the table before hashing or allocating it. */
+	if(blksz != Blksz || bufspc != Bufspc || narena < 2 ||
+	    narena >= 512 || narena > (uint)((sz-112)/16))
+		packbad();
+	xh = bufhash(p0, 104 + 16*narena);
+	dh = UNPACK64(p0 + 104 + 16*narena);
 	if(dh != xh)
 		error("corrupt superblock: %llx != %llx", dh, xh);
-	assert(fi->narena < 256);	/* should be more than anyone needs */
+	fi->blksz = blksz;
+	fi->bufspc = bufspc;
+	fi->narena = narena;
+	fi->snap.ht = UNPACK32(p); p += 4;
+	fi->snap.bp.addr = UNPACK64(p); p += 8;
+	fi->snap.bp.hash = UNPACK64(p); p += 8;
+	fi->snap.bp.gen = -1;
+	fi->snapdl.hd.addr = UNPACK64(p); p += 8;
+	fi->snapdl.hd.hash = UNPACK64(p); p += 8;
+	fi->snapdl.hd.gen = -1;
+	fi->snapdl.gen = -1;
+	fi->snapdl.tl.addr = UNPACK64(p); p += 8;
+	fi->snapdl.tl.hash = UNPACK64(p); p += 8;
+	fi->snapdl.tl.gen = -1;
+	fi->snapdl.gen = -1;
+	fi->flag = UNPACK64(p); p += 8;
+	fi->nextqid = UNPACK64(p); p += 8;
+	fi->nextgen = UNPACK64(p); p += 8;
+	qgen = UNPACK64(p); p += 8;
+	packneed(p, e, narena*16 + 8);
+	fi->arenabp = emalloc(narena * sizeof(Bptr), 0);
+	for(i = 0; i < (int)narena; i++){
+		fi->arenabp[i].addr = UNPACK64(p); p += 8;
+		fi->arenabp[i].hash = UNPACK64(p); p += 8;
+		fi->arenabp[i].gen = -1;
+	}
+	p += 8;
+	aswapv(&fi->qgen, qgen);
 	return p;
 }
 

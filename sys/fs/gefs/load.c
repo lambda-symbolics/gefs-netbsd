@@ -86,6 +86,9 @@ loadfs(char *dev)
 	if((d = dirfstat(fs->fd)) == nil)
 		sysfatal("stat %s: %r", dev);
 	eb = d->length;
+	free(d);
+	if(eb < 4*Blksz)
+		error(Ecorrupt);
 	eb = eb - (eb%Blksz) - Blksz;
 	bhd = (Bptr){0, -1, -1};
 	btl = (Bptr){eb, -1, -1};
@@ -108,7 +111,15 @@ loadfs(char *dev)
 		sysfatal("malloc: %r");
 	for(i = 0; i < fs->narena; i++){
 		a = &fs->arenas[i];
+		/* NetBSD: bound each arena against the device before replay. */
+		if(fs->arenabp[i].addr < Blksz || fs->arenabp[i].addr > eb-2*Blksz)
+			error(Ecorrupt);
 		loadarena(a, fs->arenabp[i]);
+		if(a->size <= 0 || (a->size & (Blksz-1)) != 0 ||
+		    a->size > eb - fs->arenabp[i].addr - 2*Blksz ||
+		    (i > 0 && fs->arenabp[i].addr < fs->arenabp[i-1].addr +
+		    fs->arenas[i-1].size + 2*Blksz))
+			error(Ecorrupt);
 		a->reserve = a->size / 1024;
 		if(a->reserve < 512*KiB)
 			a->reserve = 512*KiB;

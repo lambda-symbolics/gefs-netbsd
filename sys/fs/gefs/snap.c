@@ -617,7 +617,8 @@ opensnap(char *label, int *flg)
 	k.nk = p - buf;
 	if(!btlookup(&fs->snap, &k, &kv, buf, sizeof(buf)))
 		return nil;
-	assert(kv.nv == 1+8+4);
+	if(kv.nv != 1+8+4 || kv.v[0] != Ksnap)
+		error(Ecorrupt);
 	gen = UNPACK64(kv.v + 1);
 	if(flg != nil)
 		*flg = UNPACK32(kv.v + 1+8);

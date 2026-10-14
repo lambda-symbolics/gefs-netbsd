@@ -23,6 +23,9 @@
 /* 9front's schedule when neither the label nor the file system sets one */
 static char Retaindef[] = "60@m 24@h @d";
 
+/* Keep the history ring bounded: 65536 names are 8 MiB per tier. */
+#define Retainmax 65536
+
 static Cron crondef[] = {
 	{.cnt=0, .div=60, .tag="minute"},
 	{.cnt=0, .div=3600, .tag="hour"},
@@ -148,15 +151,24 @@ static int
 getnum(char **pp, vlong *v)
 {
 	char *p;
+	int d, overflow;
+	vlong vmax;
 
 	p = *pp;
 	if(*p < '0' || *p > '9')
 		return 0;
+	vmax = (vlong)(~(uvlong)0 >> 1);
 	*v = 0;
-	while(*p >= '0' && *p <= '9' && *v < 1000000000)
-		*v = *v*10 + *p++ - '0';
+	overflow = 0;
+	while(*p >= '0' && *p <= '9'){
+		d = *p++ - '0';
+		if(*v > vmax / 10 || (*v == vmax / 10 && d > vmax % 10))
+			overflow = 1;
+		else if(!overflow)
+			*v = *v*10 + d;
+	}
 	*pp = p;
-	return 1;
+	return overflow ? -1 : 1;
 }
 
 /* --- the schedule --- */
@@ -193,10 +205,14 @@ parseretain(char *s, Cron *crons)
 		cnt = -1;
 		div = 1;
 		op = -1;
-		getnum(&p, &cnt);
+		if(getnum(&p, &cnt) < 0)
+			return 0;
+		if(cnt > Retainmax)
+			return 0;
 		if(*p++ != '@')
 			return 0;
-		getnum(&p, &div);
+		if(getnum(&p, &div) < 0)
+			return 0;
 		if(*p == 'm' || *p == 'h' || *p == 'd')
 			op = *p++;
 		if(div <= 0 || (*p != 0 && !isblank9(*p)))
@@ -206,7 +222,7 @@ parseretain(char *s, Cron *crons)
 		for(i = 0; i < nelem(crondef); i++)
 			if(crondef[i].tag[0] == op)
 				break;
-		if(i == nelem(crondef))
+		if(i == nelem(crondef) || div > (vlong)(~(uvlong)0 >> 1) / crondef[i].div)
 			return 0;
 		if(crons != nil){
 			crons[i].cnt = cnt;
@@ -245,7 +261,7 @@ retainspec(Mount *mnt, char *buf, int nbuf)
 static void
 loadhist(Mount *mnt, Cron *c)
 {
-	char pfx[128], buf[128], (*del)[128];
+	char pfx[128], buf[128], (*del)[128], (*next)[128];
 	int i, ns, ndel, maxdel;
 	Scan *s;
 
@@ -271,7 +287,9 @@ loadhist(Mount *mnt, Cron *c)
 			continue;
 		if(ndel == maxdel){
 			maxdel = maxdel ? 2*maxdel : 16;
-			del = realloc(del, maxdel*sizeof(del[0]));
+			if((next = realloc(del, maxdel*sizeof(del[0]))) == nil)
+				error(Enomem);
+			del = next;
 		}
 		memcpy(buf, s->kv.k+1, s->kv.nk-1);
 		buf[s->kv.nk-1] = 0;
@@ -298,8 +316,8 @@ loadhist(Mount *mnt, Cron *c)
 
 /*
  * Set up a mutable label's schedule (on getmount, and when it changes).
- * A bad spec takes no snapshots, so that the label can still be mounted
- * and the spec fixed.
+ * A malformed persisted spec is corruption, not an empty schedule: callers
+ * can report the error and repair the config without deleting snapshots.
  */
 void
 loadautos(Mount *mnt)
@@ -308,7 +326,6 @@ loadautos(Mount *mnt)
 	Cron crons[nelem(mnt->cron)];
 	int i, n;
 
-	freeautos(mnt);
 	if(!(mnt->flag & Lmut) || mnt == fs->snapmnt)
 		return;
 	rbuf = emalloc(Kvmax+1, 0);
@@ -319,20 +336,23 @@ loadautos(Mount *mnt)
 	spec = retainspec(mnt, rbuf, Kvmax+1);
 	memcpy(crons, crondef, sizeof(crons));
 	if(!parseretain(spec, crons)){
-		fprint(2, "gefs: %s: ignoring invalid snapshot schedule %q\n",
+		fprint(2, "gefs: %s: invalid persisted snapshot schedule %q\n",
 			mnt->name, spec);
 		poperror();
 		free(rbuf);
-		return;
+		error(Ecorrupt);
 	}
 	poperror();
 	free(rbuf);
+	freeautos(mnt);
 	for(i = 0; i < nelem(crons); i++){
 		mnt->cron[i] = crons[i];
 		if(crons[i].div == 0)
 			continue;
 		n = (crons[i].cnt <= 0) ? 1 : crons[i].cnt;
-		mnt->cron[i].lbl = emalloc(n*sizeof(mnt->cron[i].lbl[0]), 1);
+		if((ulong)n > ~(ulong)0 / sizeof(mnt->cron[i].lbl[0]))
+			error(Ecorrupt);
+		mnt->cron[i].lbl = emalloc((ulong)n * sizeof(mnt->cron[i].lbl[0]), 1);
 		loadhist(mnt, &mnt->cron[i]);
 	}
 }

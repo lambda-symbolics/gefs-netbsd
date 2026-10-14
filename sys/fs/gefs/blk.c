@@ -48,12 +48,134 @@ syncblk(Blk *b)
 	setflag(b, 0, Bdirty);
 }
 
+/* NetBSD: reject damaged metadata before hashing or decoding its payload. */
+static void
+checklog(Blk *b)
+{
+	char *p, *e;
+	uvlong ent, off, len;
+	int n, op;
+
+	if(b->logsz > Logspc)
+		error("%s: allocation log too large", Ecorrupt);
+	p = b->data;
+	e = p + b->logsz;
+	while(p < e){
+		if(e-p < 8)
+			error("%s: truncated allocation log entry", Ecorrupt);
+		ent = UNPACK64(p);
+		op = ent & 0xff;
+		n = op >= Log2wide ? 16 : 8;
+		if(e-p < n)
+			error("%s: truncated allocation log entry", Ecorrupt);
+		off = ent & ~0xffULL;
+		if(op == LogAlloc || op == LogFree){
+			len = UNPACK64(p+8);
+			if(len == 0 || (off & (Blksz-1)) != 0
+			|| (len & (Blksz-1)) != 0 || off > (uvlong)~0ULL-len)
+				error("%s: invalid allocation log range", Ecorrupt);
+		}else if(op == LogAlloc1 || op == LogFree1){
+			if((off & (Blksz-1)) != 0)
+				error("%s: invalid allocation log block", Ecorrupt);
+		}else if(op == LogSync){
+			/* The upper bits are a generation, not a block address. */
+		}else
+			error("%s: invalid allocation log operation", Ecorrupt);
+		p += n;
+	}
+}
+
+static void
+checkdlist(Blk *b)
+{
+	char *p, *e;
+	uvlong addr;
+
+	if(b->logsz > Logspc || (b->logsz & 7) != 0)
+		error("%s: invalid deadlist size", Ecorrupt);
+	p = b->data;
+	e = p + b->logsz;
+	while(p < e){
+		addr = UNPACK64(p);
+		if(addr == (uvlong)-1 || (addr & (Blksz-1)) != 0)
+			error("%s: invalid deadlist entry", Ecorrupt);
+		p += 8;
+	}
+}
+
+static void
+checkkv(char *base, int lim, int nval, int valsz, int pivot)
+{
+	char *p, *e;
+	int i, off, nk, nv, used;
+
+	if(nval < pivot || nval > lim/2 || valsz < 0 || valsz > lim-2*nval)
+		error("%s: invalid tree block counts", Ecorrupt);
+	p = base;
+	e = base + lim;
+	used = 0;
+	for(i = 0; i < nval; i++){
+		off = UNPACK16(base + 2*i);
+		if(off < lim-valsz || off < 2*nval || off > lim-2)
+			error("%s: invalid tree value offset", Ecorrupt);
+		p = base + off;
+		if(e-p < 2)
+			error("%s: truncated tree key", Ecorrupt);
+		nk = UNPACK16(p); p += 2;
+		if(nk > Keymax || e-p < nk+2)
+			error("%s: invalid tree key extent", Ecorrupt);
+		p += nk;
+		nv = UNPACK16(p); p += 2;
+		if(nv > Inlmax || e-p < nv || (pivot && nv != Pptrsz))
+			error("%s: invalid tree value extent", Ecorrupt);
+		used += 2 + nk + 2 + nv;
+	}
+	if(used != valsz)
+		error("%s: invalid tree value size", Ecorrupt);
+}
+
+static void
+checkmsg(char *base, int lim, int nbuf, int bufsz)
+{
+	char *p, *e;
+	int i, off, nk, nv, op, used;
+
+	if(nbuf < 0 || nbuf > lim/2 || bufsz < 0 || bufsz > lim-2*nbuf)
+		error("%s: invalid pivot message counts", Ecorrupt);
+	p = base;
+	e = base + lim;
+	used = 0;
+	for(i = 0; i < nbuf; i++){
+		off = UNPACK16(base + 2*i);
+		if(off < lim-bufsz || off < 2*nbuf || off > lim-3)
+			error("%s: invalid pivot message offset", Ecorrupt);
+		p = base + off;
+		if(e-p < 3)
+			error("%s: truncated pivot message", Ecorrupt);
+		op = (uchar)p[0]; p++;
+		if(op >= Nmsgtype || e-p < 2)
+			error("%s: invalid pivot message", Ecorrupt);
+		nk = UNPACK16(p); p += 2;
+		if(nk > Keymax || e-p < nk+2)
+			error("%s: invalid pivot message key", Ecorrupt);
+		p += nk;
+		nv = UNPACK16(p); p += 2;
+		if(nv > Kpmax || e-p < nv)
+			error("%s: invalid pivot message value", Ecorrupt);
+		used += 1 + 2 + nk + 2 + nv;
+	}
+	if(used != bufsz)
+		error("%s: invalid pivot message size", Ecorrupt);
+}
+
 static void
 readblk(Blk *b, Bptr bp, int flg, uintptr)
 {
 	vlong off, xh, ck, rem, n;
 	char *p;
 
+	if(bp.addr < 0 || (bp.addr & (Blksz-1)) != 0)
+		error("%s: invalid block address", Ecorrupt);
 	off = bp.addr;
 	rem = Blksz;
 	p = b->buf;
@@ -84,7 +206,6 @@ readblk(Blk *b, Bptr bp, int flg, uintptr)
 	switch(b->type){
 	default:
 		error("invalid block type %d @%llx", b->type, bp);
-		break;
 	case Tdat:
 	case Tsuper:
 		b->data = b->buf;
@@ -92,27 +213,34 @@ readblk(Blk *b, Bptr bp, int flg, uintptr)
 	case Tarena:
 		b->data = p;
 		break;
-	case Tdlist:
 	case Tlog:
-		b->logsz = UNPACK16(p);		p += 2;
-		b->logh = UNPACK64(p);		p += 8;
-		b->logp = unpackbp(p, Ptrsz);	p += Ptrsz;
-		bassert(b, p - b->buf == Loghdsz);
+		b->logsz = UNPACK16(p); p += 2;
+		b->logh = UNPACK64(p); p += 8;
+		b->logp = unpackbp(p, Ptrsz); p += Ptrsz;
 		b->data = p;
+		checklog(b);
+		break;
+	case Tdlist:
+		b->logsz = UNPACK16(p); p += 2;
+		b->logh = UNPACK64(p); p += 8;
+		b->logp = unpackbp(p, Ptrsz); p += Ptrsz;
+		b->data = p;
+		checkdlist(b);
 		break;
 	case Tpivot:
-		b->nval = UNPACK16(p);		p += 2;
-		b->valsz = UNPACK16(p);		p += 2;
-		b->nbuf = UNPACK16(p);		p += 2;
-		b->bufsz = UNPACK16(p);		p += 2;
-		bassert(b, p - b->buf == Pivhdsz);
+		b->nval = UNPACK16(p); p += 2;
+		b->valsz = UNPACK16(p); p += 2;
+		b->nbuf = UNPACK16(p); p += 2;
+		b->bufsz = UNPACK16(p); p += 2;
 		b->data = p;
+		checkkv(b->data, Pivspc, b->nval, b->valsz, 1);
+		checkmsg(b->data + Pivspc, Bufspc, b->nbuf, b->bufsz);
 		break;
 	case Tleaf:
-		b->nval = UNPACK16(p);		p += 2;
-		b->valsz = UNPACK16(p);		p += 2;
-		bassert(b, p - b->buf == Leafhdsz);
+		b->nval = UNPACK16(p); p += 2;
+		b->valsz = UNPACK16(p); p += 2;
 		b->data = p;
+		checkkv(b->data, Leafspc, b->nval, b->valsz, 0);
 		break;
 	}
 	if(b->type == Tlog || b->type == Tdlist){
@@ -147,26 +275,29 @@ getarena(vlong b)
 	vlong alo, ahi;
 	Arena *a;
 
-	lo = 0;
-	hi = fs->narena;
+	if(b < 0 || (b & (Blksz-1)) != 0)
+		error("%s: invalid block address", Ecorrupt);
 	if(b == fs->sb0->bp.addr)
 		return &fs->arenas[0];
 	if(b == fs->sb1->bp.addr)
-		return &fs->arenas[hi-1];
-	while(1){
-		mid = (hi + lo)/2;
+		return &fs->arenas[fs->narena-1];
+	lo = 0;
+	hi = fs->narena - 1;
+	while(lo <= hi){
+		mid = lo + (hi-lo)/2;
 		a = &fs->arenas[mid];
 		alo = a->h0->bp.addr;
 		ahi = alo + a->size + 2*Blksz;
 		if(b < alo)
 			hi = mid-1;
-		else if(b > ahi)
+		else if(b >= ahi)
 			lo = mid+1;
 		else
 			return a;
 	}
+	error("%s: block address outside arenas", Ecorrupt);
+	return nil;
 }
-
 
 static void
 freerange(Avltree *t, vlong off, vlong len)
@@ -345,6 +476,9 @@ loadlog(Arena *a, Bptr bp)
 	traceb("loadlog", bp);
 	b = a->logbuf[0];
 	while(1){
+		/* A chain cannot contain more blocks than the arena. */
+		if(a->nlog > a->size/Blksz + 1)
+			error("%s: allocation log cycle", Ecorrupt);
 		bassert(b, checkflag(b, Bstatic, Bcached));
 		holdblk(b);
 		readblk(b, bp, 0, getcallerpc(&a));

@@ -1,8 +1,9 @@
 # Build the userland gefs tool on a host (Linux or NetBSD) with GCC.
 G=	../../sys/fs/gefs
-CORE=	host.c $(G)/p9fmt.c $(G)/p9err.c $(G)/p9user.c $(G)/avl.c $(G)/hash.c \
-	$(G)/pack.c $(G)/blk.c $(G)/cache.c $(G)/tree.c $(G)/snap.c $(G)/load.c \
-	$(G)/ream.c $(G)/check.c $(G)/dump.c $(G)/error.c $(G)/sync.c $(G)/ops.c $(G)/snapadm.c
+COMMON= host.c $(G)/p9fmt.c $(G)/p9err.c $(G)/p9user.c $(G)/avl.c $(G)/hash.c \
+	$(G)/pack.c $(G)/cache.c $(G)/tree.c $(G)/snap.c $(G)/load.c \
+	$(G)/ream.c $(G)/check.c $(G)/dump.c $(G)/error.c $(G)/sync.c $(G)/ops.c
+CORE= $(COMMON) $(G)/blk.c $(G)/snapadm.c
 CFLAGS=	-std=gnu11 -fplan9-extensions -I$(G)/compat -I$(G) -O1 -g -Wall \
 	-Wno-unused -Wno-missing-braces -Wno-parentheses -Wno-sign-compare \
 	-Wno-unknown-pragmas -Wno-overflow -Wno-char-subscripts
@@ -12,5 +13,28 @@ gefs: gefs.c $(CORE) $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ gefs.c $(CORE) -lpthread
 gefstest: ../../tests/gefstest.c $(CORE) $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ ../../tests/gefstest.c $(CORE) -lpthread
+
+# Boundary tests compile the decoder under test into the test translation unit,
+# so do not link that core object a second time.
+CORE_NOBLK= $(COMMON) $(G)/snapadm.c
+CORE_NOSNAP= $(COMMON) $(G)/blk.c
+TEST_CFLAGS= $(CFLAGS) $(EXTRA_CFLAGS)
+
+packtest: ../../tests/packtest.c $(CORE) $(HDRS)
+	$(CC) $(TEST_CFLAGS) -I. -o $@ ../../tests/packtest.c $(CORE) -lpthread $(LDFLAGS)
+blocktest: ../../tests/blocktest.c $(CORE) $(HDRS)
+	$(CC) $(TEST_CFLAGS) -I. -o $@ ../../tests/blocktest.c $(CORE_NOBLK) -lpthread $(LDFLAGS)
+retaintest: ../../tests/retaintest.c $(CORE) $(HDRS)
+	$(CC) $(TEST_CFLAGS) -I. -o $@ ../../tests/retaintest.c $(CORE_NOSNAP) -lpthread $(LDFLAGS)
+run-packtest: packtest
+	./packtest
+run-blocktest: blocktest
+	./blocktest
+run-retaintest: retaintest
+	./retaintest
+check-boundaries: run-packtest run-blocktest run-retaintest
+
 clean:
-	rm -f gefs gefstest
+	rm -f gefs gefstest packtest blocktest retaintest
+
+.PHONY: all clean check-boundaries run-packtest run-blocktest run-retaintest

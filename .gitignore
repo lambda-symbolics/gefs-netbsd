@@ -2,3 +2,6 @@
 tests/sagefs/sagefs
 sbin/gefs/gefs
 sbin/gefs/gefstest
+sbin/gefs/packtest
+sbin/gefs/blocktest
+sbin/gefs/retaintest

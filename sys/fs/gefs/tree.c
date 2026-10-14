@@ -360,17 +360,27 @@ static void
 statupdate(Kvp *kv, Msg *m)
 {
 	char *p, *e;
-	int op;
+	int op, need;
 	Xdir d;
 
-	assert(m->nv >= 1);
+	/* NetBSD: buffered stat messages also come from disk. */
+	if(m->nv < 1)
+		error(Ecorrupt);
 	p = m->v;
-	op = *p++;
+	op = (uchar)*p++;
+	need = 1 + ((op & Owsize) ? 8 : 0) + ((op & Owmode) ? 4 : 0) +
+	    ((op & Owmtime) ? 8 : 0) + ((op & Owatime) ? 8 : 0) +
+	    ((op & Owuid) ? 4 : 0) + ((op & Owgid) ? 4 : 0) +
+	    ((op & Owmuid) ? 4 : 0);
+	if(op & ~(Owsize|Owmode|Owmtime|Owatime|Owuid|Owgid|Owmuid) || m->nv != need)
+		error(Ecorrupt);
 	/*
 	 * NetBSD: a file with several names keeps its attributes in its
 	 * Khref record, refs[8] then an entry's value; update those.
 	 */
 	if(kv->nk == 9 && kv->k[0] == Kconf+1){
+		if(kv->nv != 8+Xdirsz && kv->nv != 8+Xdirsz+8)
+			error(Ecorrupt);
 		memset(&d, 0, sizeof(d));
 		dval2dir(kv->v+8, kv->nv-8, &d);
 	}else
@@ -410,6 +420,10 @@ statupdate(Kvp *kv, Msg *m)
 		fatal("malformed stat: kv=%P, m=%M\n", kv, m);
 	if(kv->nk == 9 && kv->k[0] == Kconf+1){
 		e = packdval(kv->v+8, kv->nv-8, &d);
+		if(kv->nv == 8+Xdirsz+8){
+			PACK32(e, d.devt); e += 4;
+			PACK32(e, d.rdev); e += 4;
+		}
 		if(e == nil || e - kv->v != kv->nv)
 			fatal("repacking link record failed\n");
 		return;

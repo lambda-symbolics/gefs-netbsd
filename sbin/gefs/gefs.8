@@ -127,6 +127,7 @@ or
 keeps a snapshot for each of the last 60 minutes, 24 hours and 14 days.
 Without a count, snapshots are kept forever; without an interval, it is
 1.
+A count may not exceed 65536; larger or malformed persisted settings are rejected as corrupt.
 .Cm none
 takes no automatic snapshots (and removes the label's existing ones);
 .Cm default
