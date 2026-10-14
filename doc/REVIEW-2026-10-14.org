@@ -1,0 +1,134 @@
+#+TITLE: GEFS+ reliability and laptop-efficiency review
+#+DATE: 2026-10-14
+
+Reviewed baseline: =1ffe890=. Scope: the shared core, NetBSD vnode/worker
+integration, commit scheduling, and the laptop notes. Changes were tested
+on Linux and in the existing NetBSD 11.0 amd64 development VM. The laptop
+and its disks were not changed.
+
+Fix commits: =3934f42= (metadata and retention), =a0bc469= (worker startup
+and waiting sync).
+
+* Correctness fixes
+
+Line references below identify the original revision.
+
+** Disk decoding and arena lookup
+
+- =pack.c:519-549=: =unpacksb= allocated and read an arena table using an
+  unchecked on-disk count, before checking its checksum. A count of 2048
+  reproduced an AddressSanitizer heap-buffer-overflow. Validate the format,
+  count and checksum before allocation; accept counts supported by the
+  writer. Check arena geometry against the device in =loadfs=.
+- =blk.c:95-125=: an oversized allocation-log length reached the hash
+  routine outside the block. Reproduced with length 65535. Validate log
+  lengths, entry widths and operations, and deadlist entry bounds first.
+- =blk.c:103-116= and =tree.c:103-115=: tree offsets and key/value lengths
+  were trusted after a block checksum. A checksummed leaf with an offset
+  of 65535 reproduced an out-of-bounds read. Validate leaf and pivot
+  counts, extents, aggregate sizes, pointer records and buffered messages.
+- =blk.c:144-167=: =getarena= could loop forever below the first arena or
+  index beyond the last. The original below-range test timed out. Use a
+  bounded binary search and exclusive arena end, with errors for invalid
+  addresses. Bound allocation-log traversal by arena size as well.
+- =pack.c=, =tree.c:374-375= and =snap.c:620=: check directory values,
+  hard-link attribute records, strings, tree/deadlist records and snapshot
+  labels before decoding them. Check buffered stat-message sizes before
+  reading their fields. Preserve the OpenBSD device-node tail when updating
+  a hard-link attribute record.
+
+These are input checks, with recoverable filesystem errors, not changes to
+valid on-disk records. This review did not establish that every possible
+logical inconsistency or cyclic metadata graph is recoverable.
+
+** Failed mount and worker startup
+
+- =gefs_vfsops.c:241=: failed loading could leave a nonzero arena count but
+  no arena allocation; =gefs_freefs= dereferenced that null table. Cleanup
+  now tolerates that partial state. Three mounts with damaged superblocks
+  returned EIO in the VM, followed by successful normal mounts.
+- =gefs_work.c:498-519=: failed mutator creation abandoned initialized
+  synchronization objects. Failed reader creation was ignored, including
+  the case where no reader existed and every queued page-in would wait
+  forever. Any startup failure now stops started workers and destroys the
+  queue synchronization objects. Native compilation and normal lifecycle
+  tests passed; thread-creation failure injection was not run.
+
+** Sync and retention
+
+- =gefs_vfsops.c:762-808=: even =MNT_WAIT= used nonwaiting page submission
+  and skipped busy vnodes; =gefs_putall= discarded pageout errors. Waiting
+  sync now waits for vnode/page I/O and propagates submission or recorded
+  write errors before acknowledging the durable commit.
+- =snapadm.c:147-216,330-336=: a retention count of one billion requested
+  roughly 128 GB for a history ring. Counts are now limited to 65536 per
+  tier, with decimal and interval-overflow checks. Persisted settings are
+  validated before replacing a schedule or trimming history. The limit is
+  documented in =gefs(8)=.
+
+* Verification
+
+- Original =gefstest= passed on a disposable 512 MB image before changes.
+- Updated =gefstest= passed repeatedly, including full-filesystem recovery,
+  snapshots, reloads, truncation and growth.
+- =make -f Makefile.host check-boundaries= passed on Linux with
+  AddressSanitizer and on NetBSD with the native compiler/make. Leak
+  detection was disabled for the host harness, which retains its global
+  filesystem/cache allocation until process exit.
+- The updated kernel module and mount/helper tools built on NetBSD 11.0.
+- Three native =fsxlite= runs passed, each 20000 operations with mmap,
+  seeds 814, 815 and 816. The third used the final module.
+- Three 16-thread runs each completed 1600 durable fsyncs. The final run used
+  218 commits and 436 flushes, 7.34 fsyncs per commit; p50 8.42 ms,
+  p99 16.13 ms. These are VM results, not laptop energy measurements.
+- Online filesystem checks passed after all three workloads.
+- A clean mounted filesystem showed zero commits, writes and flushes over
+  35 seconds, spanning the normal syncer interval.
+- With =lazymax= temporarily set to 2 seconds, a forced-atime probe over
+  35 seconds exercised both age and lazy commit reasons: two commits and
+  four flushes. The default of 300 seconds was restored afterward.
+
+Host evidence is under =/tmp/gefs-review-arynFNp1/=; guest images and build
+logs are under =/build/gefs-audit-20261014/=. Tests used newly created vnd
+images, not the scratch root or EFI disks. This pass did not repeat the
+previous power-cut campaign or test the laptop suspend/resume path.
+
+* Power-efficiency priorities
+
+1. *Durable commit before selective s2idle.* The custom laptop
+   =kernel/dev/acpi/acpi.c:acpi_enter_freeze= freezes userspace and suspends
+   devices without a synchronous filesystem barrier. Add an error-checked
+   =VFS_SYNC(..., MNT_WAIT, ...)= pass before storage suspend, with mount
+   lifetime protection and a policy for quiescing background mutations.
+   A bare =sync(2)= is insufficient here: NetBSD's =do_sys_sync= requests
+   =MNT_NOWAIT=, and =vfs_syncwait= counts vnode I/O, not GEFS commit tickets.
+   The waiting-sync correction above is a prerequisite, not the laptop
+   suspend hook itself. Treat this as a root-migration prerequisite.
+2. *Snapshot/deadlist write amplification.* The existing measurements in
+   =GEFSPLUS.org= show roughly 2300 block writes after truncation with old
+   snapshot generations. Prioritize a format-compatible reduction in
+   repeated deadlist copying and measure both retained-space cost and
+   write volume. The predecessor-snapshot sweep also dirties the normal
+   commit path rather than using the lazy deadline; establish its crash
+   invariants before changing that classification.
+3. *Clean syncer wakeups.* The mutator has no timer when clean, but the VFS
+   syncer still posts =gefs_agejob= on its lazy pass. That job only backdates
+   dirty age. Count these wakeups and avoid the job when neither a dirty
+   tree nor pending page writes need age accounting. Sleeping reader
+   threads themselves are not evidence of wasted power.
+4. *Storage-command coalescing and FUA.* Measure queue drains and contiguous
+   writes before adding a coalescer. FUA for superblocks could replace the
+   second flush only with verified device support and the same ordering
+   guarantees. Retain the current two-flush protocol until tested.
+5. *AC/battery policy and measurement.* =interval=, =lazymax= and =groupwait=
+   already provide the controls; test powerd policy rather than adding
+   polling to the driver. Group commit cannot combine fsyncs separated by
+   seconds without delaying their acknowledgements. Keep =dirtypct= off
+   by default as measured. Use unattended runs with fixed retention,
+   workload and APST settings; collect commit reasons, write/flush counts,
+   latency and energy per operation. Longer dirty windows trade bounded
+   crash exposure for fewer wakeups, so choose them explicitly.
+
+Atime deferral, durable group commit, clean-commit skipping and pressure
+queue draining are already implemented. The observations above do not
+justify a new intent-log format, order-only fsync, or claimed watt savings.
