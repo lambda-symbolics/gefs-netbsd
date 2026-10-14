@@ -18,6 +18,7 @@
 #include <sys/kmem.h>
 #include <sys/kthread.h>
 #include <sys/mount.h>
+#include <sys/fstrans.h>
 #include <sys/vnode.h>
 #include <sys/buf.h>
 #include <sys/queue.h>
@@ -113,12 +114,14 @@ gefs_runjob(struct gefsdev *gd, struct gefsjob *j)
 		/* the data is gone; the next write, fsync or close says so */
 		if(error != 0 && !(bp->b_flags & B_READ) && VTOGN(j->j_vp) != NULL)
 			VTOGN(j->j_vp)->gn_werror = error;
-		if(!(bp->b_flags & B_READ)){
-			mutex_enter(&gd->gd_jlk);
-			if(gd->gd_nwq-- == GEFS_MAXWQ)
-				cv_broadcast(&gd->gd_wqcv);
-			mutex_exit(&gd->gd_jlk);
-		}
+		mutex_enter(&gd->gd_jlk);
+		if(bp->b_flags & B_READ){
+			KASSERT(j->j_gm->gm_nread > 0);
+			j->j_gm->gm_nread--;
+			cv_broadcast(&gd->gd_dcv);
+		}else if(gd->gd_nwq-- == GEFS_MAXWQ)
+			cv_broadcast(&gd->gd_wqcv);
+		mutex_exit(&gd->gd_jlk);
 		kmem_free(j, sizeof(*j));
 		bp->b_error = error;
 		bp->b_resid = 0;
@@ -286,7 +289,7 @@ gefs_cmtdue(struct gefsdev *gd, uint64_t *sleepns)
 			return GEFS_WSYNC;
 		due = gd->gd_cmtdue;
 	}
-	if(!agetl(&f->rdonly) && gd->gd_nrw > 0){
+	if(gd->gd_nsuspended == 0 && !agetl(&f->rdonly) && gd->gd_nrw > 0){
 		interval = (int64_t)MAX(gefs_interval, 0) * NS;
 		if(f->snap.dirty){
 			if(now - gd->gd_dirtyat >= (uint64_t)interval)
@@ -548,8 +551,9 @@ gefs_work_stop(struct gefsdev *gd)
 }
 
 /* run fn(gm, arg) on the mutator and wait for it; returns its errno */
-int
-gefs_call(struct gefsmount *gm, void (*fn)(struct gefsmount *, void *), void *arg)
+static int
+gefs_call1(struct gefsmount *gm, void (*fn)(struct gefsmount *, void *), void *arg,
+    int suspend_owner)
 {
 	struct gefsdev *gd = gm->gm_gd;
 	struct gefsjob j;
@@ -560,11 +564,20 @@ gefs_call(struct gefsmount *gm, void (*fn)(struct gefsmount *, void *), void *ar
 	j.j_arg = arg;
 	j.j_wait = 1;
 	mutex_enter(&gd->gd_jlk);
+	while(gm->gm_suspended && !suspend_owner)
+		cv_wait(&gd->gd_dcv, &gd->gd_jlk);
 	gefs_mqput(gd, &j);
 	while(!j.j_done)
 		cv_wait(&gd->gd_dcv, &gd->gd_jlk);
 	mutex_exit(&gd->gd_jlk);
 	return j.j_error;
+}
+
+int
+gefs_call(struct gefsmount *gm, void (*fn)(struct gefsmount *, void *), void *arg)
+{
+	/* Unmount and mount updates run as the exclusive transaction owner. */
+	return gefs_call1(gm, fn, arg, fstrans_is_owner(gm->gm_mp));
 }
 
 /* queue fn(gm, arg) on the mutator without waiting; fn owns arg */
@@ -573,12 +586,15 @@ gefs_post(struct gefsmount *gm, void (*fn)(struct gefsmount *, void *), void *ar
 {
 	struct gefsdev *gd = gm->gm_gd;
 	struct gefsjob *j;
+	int owner = fstrans_is_owner(gm->gm_mp);
 
 	j = kmem_zalloc(sizeof(*j), KM_SLEEP);
 	j->j_gm = gm;
 	j->j_fn = fn;
 	j->j_arg = arg;
 	mutex_enter(&gd->gd_jlk);
+	while(gm->gm_suspended && !owner)
+		cv_wait(&gd->gd_dcv, &gd->gd_jlk);
 	gefs_mqput(gd, j);
 	mutex_exit(&gd->gd_jlk);
 }
@@ -595,10 +611,11 @@ gefs_queuebuf(struct gefsmount *gm, struct vnode *vp, struct buf *bp)
 {
 	struct gefsdev *gd = gm->gm_gd;
 	struct gefsjob *j;
-	int rd, pd;
+	int rd, pd, owner;
 
 	rd = (bp->b_flags & B_READ) != 0;
 	pd = (curlwp == uvm.pagedaemon_lwp);
+	owner = fstrans_is_owner(gm->gm_mp);
 	/*
 	 * The pagedaemon may take a page of a write that extends the file
 	 * between the copy and the new v_size (gefs_write): the page write
@@ -614,6 +631,15 @@ gefs_queuebuf(struct gefsmount *gm, struct vnode *vp, struct buf *bp)
 	j->j_bp = bp;
 	j->j_vp = vp;
 	mutex_enter(&gd->gd_jlk);
+	if(pd && gm->gm_suspended){
+		mutex_exit(&gd->gd_jlk);
+		kmem_free(j, sizeof(*j));
+		goto nomem;
+	}
+	while(gm->gm_suspended && !owner)
+		cv_wait(&gd->gd_dcv, &gd->gd_jlk);
+	if(rd)
+		gm->gm_nread++;
 	if(!rd){
 		if(pd && gd->gd_nwq >= GEFS_MAXWQ){
 			mutex_exit(&gd->gd_jlk);
@@ -636,4 +662,64 @@ nomem:
 	bp->b_error = ENOMEM;
 	bp->b_resid = bp->b_bcount;
 	biodone(bp);
+}
+
+/*
+ * The suspension owner has stopped vnode transactions and flushed its pages.
+ * Admission is closed before draining readers and queuing this final barrier.
+ * Other labels may still need their own final commit; only the automatic
+ * policy is parked until every label resumes.
+ */
+static void
+gefs_suspendjob(struct gefsmount *gm, void *arg)
+{
+	struct gefsdev *gd = gm->gm_gd;
+
+	USED(arg);
+	if(gd->gd_nrw > 0 && (agetl(&fs->rdonly) || agetl(&fs->broken)))
+		error(Eio);
+	commit(Clazy);
+	mutex_enter(&gd->gd_jlk);
+	KASSERT(gm->gm_suspended && gm->gm_nread == 0);
+	/* This barrier also covers earlier nonwaiting sync requests. */
+	if(gd->gd_cmtticket <= gd->gd_jtaken &&
+	    agetv(&fs->cmtdone) >= gd->gd_cmtneed){
+		gd->gd_cmtwant = 0;
+		gd->gd_cmtflags = 0;
+	}
+	cv_broadcast(&gd->gd_cmtcv);
+	mutex_exit(&gd->gd_jlk);
+}
+
+int
+gefs_work_suspend(struct gefsmount *gm)
+{
+	struct gefsdev *gd = gm->gm_gd;
+	int error;
+
+	mutex_enter(&gd->gd_jlk);
+	KASSERT(!gm->gm_suspended);
+	gm->gm_suspended = 1;
+	gd->gd_nsuspended++;
+	while(gm->gm_nread != 0)
+		cv_wait(&gd->gd_dcv, &gd->gd_jlk);
+	mutex_exit(&gd->gd_jlk);
+	error = gefs_call1(gm, gefs_suspendjob, NULL, 1);
+	if(error != 0)
+		gefs_work_resume(gm);
+	return error;
+}
+
+void
+gefs_work_resume(struct gefsmount *gm)
+{
+	struct gefsdev *gd = gm->gm_gd;
+
+	mutex_enter(&gd->gd_jlk);
+	KASSERT(gm->gm_suspended && gd->gd_nsuspended > 0);
+	gm->gm_suspended = 0;
+	gd->gd_nsuspended--;
+	cv_broadcast(&gd->gd_dcv);
+	cv_signal(&gd->gd_mcv);
+	mutex_exit(&gd->gd_jlk);
 }

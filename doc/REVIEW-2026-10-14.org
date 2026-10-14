@@ -95,15 +95,22 @@ previous power-cut campaign or test the laptop suspend/resume path.
 
 * Power-efficiency priorities
 
-1. *Durable commit before selective s2idle.* The custom laptop
-   =kernel/dev/acpi/acpi.c:acpi_enter_freeze= freezes userspace and suspends
-   devices without a synchronous filesystem barrier. Add an error-checked
-   =VFS_SYNC(..., MNT_WAIT, ...)= pass before storage suspend, with mount
-   lifetime protection and a policy for quiescing background mutations.
-   A bare =sync(2)= is insufficient here: NetBSD's =do_sys_sync= requests
-   =MNT_NOWAIT=, and =vfs_syncwait= counts vnode I/O, not GEFS commit tickets.
-   The waiting-sync correction above is a prerequisite, not the laptop
-   suspend hook itself. Treat this as a root-migration prerequisite.
+1. *Durable commit before selective s2idle: implemented.* GEFS now stops
+   vnode transactions, flushes dirty pages, closes worker admission, drains
+   page reads and commits before acknowledging suspension. Automatic commit
+   timers are parked; suspension-owner work for other labels on the device
+   is allowed. Sync and device-wide administration participate in fstrans.
+   Failed suspension reopens admission, and unmount/update use the standard
+   owner path. Successful unmount releases the worker gate before freeing
+   mount data; generic resume tolerates the cleared pointer.
+
+   Native tests passed for one mount, two labels sharing a device, recorded
+   write-error rollback, a writer blocked until resume, busy-unmount rollback,
+   forced unmount, and read-only to read-write update. With interval and lazy
+   deadlines set to one second, a 35-second hold had zero device reads, writes
+   or flushes. The combined module passed 10000 fsxlite operations, 400 fsyncs,
+   and online/offline checks. See =tests/suspend/README=. The matching nanobsd
+   all-filesystem barrier is separate; laptop suspend/resume remains untested.
 2. *Snapshot/deadlist write amplification: measured reduction.* The format-compatible
    merge now batches 32 deadlist metadata replacements and avoids inserting an
    empty successor record before the first merge. In the real-block host fixture

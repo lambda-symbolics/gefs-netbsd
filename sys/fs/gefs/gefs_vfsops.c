@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/conf.h>
+#include <sys/fstrans.h>
 #include <miscfs/genfs/genfs.h>
 #include <miscfs/specfs/specdev.h>
 
@@ -661,6 +662,9 @@ gefs_unmount(struct mount *mp, int mntflags)
 			return error;
 		}
 	}
+	/* Generic dounmount resumes after VFS_UNMOUNT has freed mnt_data. */
+	if(gm->gm_suspended)
+		gefs_work_resume(gm);
 	LIST_REMOVE(gm, gm_link);
 	devvp = gd->gd_devvp;
 	if(!LIST_EMPTY(&gd->gd_mounts)){
@@ -753,8 +757,8 @@ static bool
 gefs_sync_selector(void *cl, struct vnode *vp)
 {
 	KASSERT(mutex_owned(vp->v_interlock));
-	return vp->v_type == VREG && (vp->v_iflag & VI_ONWORKLST) != 0 &&
-	    VTOGN(vp) != NULL;
+	return vp->v_type == VREG && VTOGN(vp) != NULL &&
+	    ((vp->v_iflag & VI_ONWORKLST) != 0 || VTOGN(vp)->gn_werror != 0);
 }
 
 /*
@@ -794,7 +798,7 @@ gefs_putall(struct mount *mp, int wait)
  * clean file system writes nothing.
  */
 static int
-gefs_sync(struct mount *mp, int waitfor, kauth_cred_t cred)
+gefs_sync1(struct mount *mp, int waitfor, kauth_cred_t cred)
 {
 	struct gefsmount *gm = VFSTOGEFS(mp);
 
@@ -834,6 +838,53 @@ gefs_sync(struct mount *mp, int waitfor, kauth_cred_t cred)
 	mutex_exit(&gd->gd_jlk);
 	gefs_post(gm, gefs_agejob, NULL);
 	return 0;
+}
+
+/* The generic VFS_SYNC wrapper does not acquire a filesystem transaction. */
+static int
+gefs_sync(struct mount *mp, int waitfor, kauth_cred_t cred)
+{
+	struct gefsmount *gm = VFSTOGEFS(mp);
+	struct gefsdev *gd = gm->gm_gd;
+	int error, suspended;
+
+	error = fstrans_start_nowait(mp);
+	if(error != 0)
+		return error;
+	mutex_enter(&gd->gd_jlk);
+	suspended = gm->gm_suspended;
+	mutex_exit(&gd->gd_jlk);
+	/* The suspension owner may sync again after our durable barrier. */
+	error = suspended ? 0 : gefs_sync1(mp, waitfor, cred);
+	fstrans_done(mp);
+	return error;
+}
+
+static int
+gefs_suspendctl(struct mount *mp, int cmd)
+{
+	struct gefsmount *gm = VFSTOGEFS(mp);
+	int error;
+
+	switch(cmd){
+	case SUSPEND_SUSPEND:
+		error = genfs_suspendctl(mp, cmd);
+		if(error != 0)
+			return error;
+		/* As transaction owner we can flush pages after stopping writers. */
+		error = gm->gm_ronly ? 0 : gefs_putall(mp, 1);
+		if(error == 0)
+			error = gefs_work_suspend(gm);
+		if(error != 0)
+			(void)genfs_suspendctl(mp, SUSPEND_RESUME);
+		return error;
+	case SUSPEND_RESUME:
+		if(gm != NULL)
+			gefs_work_resume(gm);
+		return genfs_suspendctl(mp, cmd);
+	default:
+		return EINVAL;
+	}
 }
 
 /* --- administration: GEFSIOC_CTL and GEFSIOC_STATUS --- */
@@ -940,27 +991,50 @@ gefs_admin(struct gefsmount *gm, struct gefs_ctl *gc, int status, kauth_cred_t c
 	strlcpy(buf, gc->gc_cmd, sizeof(buf));
 	nw = ctltokenize(buf, w, nelem(w));
 	rw_enter(&gefs_mntlock, RW_READER);
+	/* Hold every label before a device-wide command, without waiting behind
+	 * a suspended label while we already hold another label's transaction. */
+	LIST_FOREACH(o, &gd->gd_mounts, gm_link){
+		error = fstrans_start_nowait(o->gm_mp);
+		if(error != 0){
+			struct gefsmount *held;
+
+			LIST_FOREACH(held, &gd->gd_mounts, gm_link){
+				if(held == o)
+					break;
+				fstrans_done(held->gm_mp);
+			}
+			rw_exit(&gefs_mntlock);
+			return error;
+		}
+	}
 	LIST_FOREACH(o, &gd->gd_mounts, gm_link){
 		if(o->gm_ronly)
 			continue;
 		if((nw == 1 && strcmp(w[0], "sync") == 0)
 		|| (nw == 3 && (strcmp(w[0], "snap") == 0 || strcmp(w[0], "fork") == 0)
-		    && strcmp(w[1], o->gm_label) == 0))
-			gefs_putall(o->gm_mp, 1);
+		    && strcmp(w[1], o->gm_label) == 0)){
+			error = gefs_putall(o->gm_mp, 1);
+			if(error != 0)
+				break;
+		}
 	}
+	if(error == 0){
+		c.cmd = gc->gc_cmd;
+		c.outsz = 16*1024;
+		c.out = kmem_zalloc(c.outsz, KM_SLEEP);
+		error = gefs_call(gm, gefs_ctljob, &c);
+		if(error == 0)
+			error = c.error;
+	}
+	LIST_FOREACH(o, &gd->gd_mounts, gm_link)
+		fstrans_done(o->gm_mp);
 	rw_exit(&gefs_mntlock);
-
-	c.cmd = gc->gc_cmd;
-	c.outsz = 16*1024;
-	c.out = kmem_zalloc(c.outsz, KM_SLEEP);
-	error = gefs_call(gm, gefs_ctljob, &c);
-	if(error == 0)
-		error = c.error;
 	/* with the NUL: when the ioctl fails, gc_len does not come back */
 	if(gc->gc_buf != NULL && gc->gc_len > 0 && c.nout > 0)
 		(void)copyout(c.out, gc->gc_buf, MIN(gc->gc_len, (size_t)c.nout + 1));
 	gc->gc_len = c.nout;
-	kmem_free(c.out, c.outsz);
+	if(c.out != NULL)
+		kmem_free(c.out, c.outsz);
 	return error;
 }
 
@@ -1146,7 +1220,7 @@ struct vfsops gefs_vfsops = {
 	.vfs_done = gefs_done,
 	.vfs_snapshot = gefs_snapshot,
 	.vfs_extattrctl = vfs_stdextattrctl,
-	.vfs_suspendctl = genfs_suspendctl,
+	.vfs_suspendctl = gefs_suspendctl,
 	.vfs_renamelock_enter = genfs_renamelock_enter,
 	.vfs_renamelock_exit = genfs_renamelock_exit,
 	.vfs_fsync = (void *)eopnotsupp,

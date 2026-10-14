@@ -1,0 +1,34 @@
+GEFS native suspension test
+===========================
+
+Build with NetBSD make and matching kernel headers, with the tested GEFS
+module loaded. Use disposable mounted image files. The path must name an
+existing regular file, not the mountpoint.
+
+    make
+    modload -s path=/mnt/gefs/file -i seconds=35 ./suspendtest.kmod
+    modunload suspendtest
+    modload -s path=/mnt/gefs/file -b inject=true ./suspendtest.kmod
+    modunload suspendtest
+    modload -s path=/mnt/gefs/file -s path2=/mnt/fork/file ./suspendtest.kmod
+    modunload suspendtest
+
+The module holds a durable suspension, performs waiting sync, and checks
+that device reads, writes and cache flushes do not change during the hold.
+Set vfs.gefs.interval and vfs.gefs.lazymax to 1 to cross background deadlines;
+restore their previous values afterward. The injection case records EIO on
+the vnode and checks suspension rollback, then restores the error field.
+It does not inject a physical device failure.
+
+For admission testing, start a 10-second hold in the background, then write
+to a file on that mount. Verify the writer is blocked during the hold and
+completes after resume. Also exercise normal unmount, a busy unmount followed
+by a successful write, forced unmount, and a read-only mount updated to
+read-write. These use the same NetBSD suspension protocol as s2idle.
+
+The 2026-10-14 NetBSD 11 VM run passed all of the above, including two labels
+sharing one vnd device and a 35-second hold spanning the syncer interval.
+Device I/O deltas were zero during every hold. A read-write to read-only
+update returned EOPNOTSUPP; subsequent writes and normal unmount succeeded.
+The combined module passed fsxlite (10000 operations), 400 concurrent fsyncs,
+and online plus offline checks. Laptop suspend/resume was not tested.

@@ -98,6 +98,7 @@ struct gefsdev {
 	kcondvar_t	gd_wqcv;	/* room in the write queue */
 	struct lwp	*gd_mutlwp;	/* the mutator */
 	int		gd_mactive;	/* mutator running a job or commit; gd_jlk */
+	int		gd_nsuspended;	/* suspended labels; pause background commits */
 	volatile int	gd_lazyq;	/* a lazy commit is queued */
 	/*
 	 * Commits, gefs_work.c: the mutator runs them, for requests (group
@@ -134,6 +135,8 @@ struct gefsmount {
 	struct Mount	*gm_mnt;	/* the label mounted */
 	struct Dent	*gm_rootde;
 	int		gm_ronly;
+	int		gm_suspended;	/* worker admission closed; gd_jlk */
+	int		gm_nread;	/* queued or running page reads; gd_jlk */
 	char		gm_label[64];
 };
 
@@ -174,6 +177,8 @@ int	p9capture(char *, int);
 /* gefs_work.c */
 int	gefs_work_start(struct gefsdev *);
 void	gefs_work_stop(struct gefsdev *);
+int	gefs_work_suspend(struct gefsmount *);
+void	gefs_work_resume(struct gefsmount *);
 int	gefs_call(struct gefsmount *, void (*)(struct gefsmount *, void *), void *);
 void	gefs_post(struct gefsmount *, void (*)(struct gefsmount *, void *), void *);
 void	gefs_queuebuf(struct gefsmount *, struct vnode *, struct buf *);
