@@ -5,3 +5,5 @@ sbin/gefs/gefstest
 sbin/gefs/packtest
 sbin/gefs/blocktest
 sbin/gefs/retaintest
+
+sbin/gefs/deadlisttest

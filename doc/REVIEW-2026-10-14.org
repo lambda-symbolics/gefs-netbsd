@@ -104,13 +104,15 @@ previous power-cut campaign or test the laptop suspend/resume path.
    =MNT_NOWAIT=, and =vfs_syncwait= counts vnode I/O, not GEFS commit tickets.
    The waiting-sync correction above is a prerequisite, not the laptop
    suspend hook itself. Treat this as a root-migration prerequisite.
-2. *Snapshot/deadlist write amplification.* The existing measurements in
-   =GEFSPLUS.org= show roughly 2300 block writes after truncation with old
-   snapshot generations. Prioritize a format-compatible reduction in
-   repeated deadlist copying and measure both retained-space cost and
-   write volume. The predecessor-snapshot sweep also dirties the normal
-   commit path rather than using the lazy deadline; establish its crash
-   invariants before changing that classification.
+2. *Snapshot/deadlist write amplification: measured reduction.* The format-compatible
+   merge now batches 32 deadlist metadata replacements and avoids inserting an
+   empty successor record before the first merge. In the real-block host fixture
+   (128 one-block Tdlist records), reclaim fell from 299 to 47 metadata writes
+   and retained growth fell from 4,341,760 to 212,992 bytes. Both the old image
+   (source=128, target=0) and new image (source=0, target=128) reloaded with
+   checkfs passing. This fixture measures metadata merging, not payload-heavy
+   truncation; the predecessor-snapshot sweep still dirties the normal commit
+   path and needs workload measurement.
 3. *Clean syncer wakeups: fixed.* Skip the age job when the mutator is idle,
    its queue is empty, no page writes are pending, and its dirty-age marker
    is clear. Read these hints under the queue lock rather than racing the

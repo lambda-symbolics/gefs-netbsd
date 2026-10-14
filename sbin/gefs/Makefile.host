@@ -35,6 +35,17 @@ run-retaintest: retaintest
 check-boundaries: run-packtest run-blocktest run-retaintest
 
 clean:
-	rm -f gefs gefstest packtest blocktest retaintest
+	rm -f gefs gefstest packtest blocktest retaintest deadlisttest
 
-.PHONY: all clean check-boundaries run-packtest run-blocktest run-retaintest
+.PHONY: all clean check-boundaries run-packtest run-blocktest run-retaintest deadlisttest run-deadlisttest
+
+
+# deadlisttest includes snap.c to reach the private reclaim path.
+DEADLIST_CORE= host.c $(G)/p9fmt.c $(G)/p9err.c $(G)/p9user.c $(G)/avl.c $(G)/hash.c \
+	$(G)/pack.c $(G)/cache.c $(G)/tree.c $(G)/load.c $(G)/ream.c \
+	$(G)/check.c $(G)/dump.c $(G)/error.c $(G)/sync.c $(G)/ops.c \
+	$(G)/blk.c $(G)/snapadm.c
+deadlisttest: ../../tests/deadlisttest.c $(DEADLIST_CORE) $(HDRS)
+	$(CC) $(TEST_CFLAGS) -I. -o $@ ../../tests/deadlisttest.c $(DEADLIST_CORE) -lpthread $(LDFLAGS)
+run-deadlisttest: deadlisttest gefs
+	set -e; img=$$(mktemp /tmp/gefs-deadlisttest.XXXXXX); old=$$(mktemp /tmp/gefs-deadlisttest-old.XXXXXX); trap 'rm -f "$$img" "$$old"' EXIT; dd if=/dev/zero of=$$img bs=1M count=0 seek=256 status=none; ./gefs ream -r none "$$img" >/dev/null; ./deadlisttest "$$img" source 128; cp "$$img" "$$old"; ./deadlisttest "$$img" reclaim 128; ./deadlisttest "$$old" oldcheck 128; ./deadlisttest "$$img" check 128; ./gefs check "$$old"; ./gefs check "$$img"

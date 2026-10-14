@@ -74,7 +74,7 @@ dlcacheget(vlong gen, vlong bgen)
 }
 
 static Dlist*
-getdl(vlong gen, vlong bgen)
+getdlx(vlong gen, vlong bgen, int persist)
 {
 	char kbuf[Dlksz], kvbuf[Dlkvpsz];
 	Dlist *dl, **p;
@@ -110,10 +110,11 @@ getdl(vlong gen, vlong bgen)
 	dl->hd.addr = -1;
 	dl->tl.addr = -1;
 	dl->ins = nil;
-
-	m.op = Oinsert;
-	dlist2kv(dl, &m, kvbuf, sizeof(kvbuf));
-	btupsert(&fs->snap, &m, 1);
+	if(persist){
+		m.op = Oinsert;
+		dlist2kv(dl, &m, kvbuf, sizeof(kvbuf));
+		btupsert(&fs->snap, &m, 1);
+	}
 Found:
 	poperror();
 	h = ihash(gen) ^ ihash(bgen);
@@ -121,6 +122,18 @@ Found:
 	dl->chain = *p;
 	*p = dl;
 	return dl;
+}
+
+static Dlist*
+getdl(vlong gen, vlong bgen)
+{
+	return getdlx(gen, bgen, 1);
+}
+
+static Dlist*
+getdlmerge(vlong gen, vlong bgen)
+{
+	return getdlx(gen, bgen, 0);
 }
 
 void
@@ -230,29 +243,44 @@ splicedl(Dlist *d, Dlist *m)
 	}
 }
 
-static void
-mergedl(vlong merge, vlong gen, vlong bgen)
-{
-	char (*buf)[Kvmax] = fs->mergedlbuf;	/* NetBSD: was on the stack */
-	Dlist *d, *m;
-	Msg msg[2];
+typedef struct Dlmerge Dlmerge;
+struct Dlmerge {
+	Dlist	*d;
+	Dlist	*m;
+	char	buf[2][Kvmax];
+};
 
-	d = getdl(merge, bgen);
-	m = getdl(gen, bgen);
-	splicedl(d, m);
-	msg[0].op = Odelete;
-	dlist2kv(m, &msg[0], buf[0], sizeof(buf[0]));
-	msg[1].op = Oinsert;
-	dlist2kv(d, &msg[1], buf[1], sizeof(buf[1]));
+enum { Mergebatch = 32 };
+
+static void
+flushmerges(Dlmerge *q, int n)
+{
+	Msg *msg;
+	int i;
+
+	if(n == 0)
+		return;
+	msg = emalloc(2*n*sizeof(Msg), 0);
+	/* btupsert may raise an error while building the replacement tree. */
 	if(waserror()){
-		putdl(m);
-		putdl(d);
+		free(msg);
 		nexterror();
 	}
-	btupsert(&fs->snap, msg, 2);
+	for(i = 0; i < n; i++){
+		msg[2*i].op = Odelete;
+		dlist2kv(q[i].m, &msg[2*i], q[i].buf[0], sizeof(q[i].buf[0]));
+		msg[2*i+1].op = Oinsert;
+		dlist2kv(q[i].d, &msg[2*i+1], q[i].buf[1], sizeof(q[i].buf[1]));
+	}
+	btupsert(&fs->snap, msg, 2*n);
 	poperror();
-	putdl(m);
-	putdl(d);
+	free(msg);
+	for(i = 0; i < n; i++){
+		putdl(q[i].m);
+		q[i].m = nil;
+		putdl(q[i].d);
+		q[i].d = nil;
+	}
 }
 
 /*
@@ -293,14 +321,29 @@ reclaimblocks(vlong gen, vlong succ, vlong prev)
 {
 	char pfx[9];
 	Dlist dl;
+	Dlmerge *mq;
+	int i, nmq;
 	Scan *s;
 
 	/* NetBSD: a Scan is 1 KiB, too much for a kernel stack */
-	s = emalloc(sizeof(Scan), 1);
+	s = nil;
+	mq = nil;
+	nmq = 0;
 	if(waserror()){
+		for(i = 0; i < nmq; i++){
+			if(mq[i].m != nil)
+				putdl(mq[i].m);
+			if(mq[i].d != nil)
+				putdl(mq[i].d);
+		}
+		if(s != nil && s->path != nil)
+			btexit(s);
+		free(mq);
 		free(s);
 		nexterror();
 	}
+	s = emalloc(sizeof(Scan), 1);
+	mq = emalloc(Mergebatch*sizeof(Dlmerge), 1);
 	pfx[0] = Kdlist;
 	PACK64(pfx+1, gen);
 	btnewscan(s, pfx, sizeof(pfx));
@@ -313,13 +356,24 @@ reclaimblocks(vlong gen, vlong succ, vlong prev)
 			btexit(s);
 			nexterror();
 		}
-		if(succ != -1 && dl.bgen <= prev)
-			mergedl(succ, dl.gen, dl.bgen);
-		else
+		if(succ != -1 && dl.bgen <= prev){
+			i = nmq++;
+			mq[i].d = nil;
+			mq[i].m = nil;
+			mq[i].d = getdlmerge(succ, dl.bgen);
+			mq[i].m = getdl(dl.gen, dl.bgen);
+			splicedl(mq[i].d, mq[i].m);
+			if(nmq == Mergebatch){
+				flushmerges(mq, nmq);
+				nmq = 0;
+			}
+		}else
 			dropdl(dl.gen, dl.bgen, succ);
 		poperror();
 	}
 	btexit(s);
+	flushmerges(mq, nmq);
+	nmq = 0;
 	if(succ != -1){
 		pfx[0] = Kdlist;
 		PACK64(pfx+1, succ);
@@ -341,6 +395,7 @@ reclaimblocks(vlong gen, vlong succ, vlong prev)
 		btexit(s);
 	}
 	poperror();
+	free(mq);
 	free(s);
 }
 

@@ -305,6 +305,15 @@ which deadlists exist, which 9front must still read correctly.  To look
 into before a gefs root on battery; this is also why the benchmarks in 2
 use =retain none=.
 
+The host deadlist fixture added on 2026-10-14 creates one real Tdlist block
+per source record. Against the 3497237 implementation, 128 records required
+299 reclaim metadata writes and grew retained space by 4,341,760 bytes. The
+batched implementation required 47 writes and grew retained space by 212,992
+bytes. Reload checks found 128 source records and no target records in the
+pre-reclaim image, and no source records and 128 target records in the
+post-reclaim image. These numbers cover empty-list metadata merging, not a
+payload-heavy truncation workload.
+
 * 5. Intent log, after measuring 2-4
 
 For mounts that need many durable =fsync= calls without a whole commit
