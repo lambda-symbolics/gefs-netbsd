@@ -111,11 +111,14 @@ previous power-cut campaign or test the laptop suspend/resume path.
    write volume. The predecessor-snapshot sweep also dirties the normal
    commit path rather than using the lazy deadline; establish its crash
    invariants before changing that classification.
-3. *Clean syncer wakeups.* The mutator has no timer when clean, but the VFS
-   syncer still posts =gefs_agejob= on its lazy pass. That job only backdates
-   dirty age. Count these wakeups and avoid the job when neither a dirty
-   tree nor pending page writes need age accounting. Sleeping reader
-   threads themselves are not evidence of wasted power.
+3. *Clean syncer wakeups: fixed.* Skip the age job when the mutator is idle,
+   its queue is empty, no page writes are pending, and its dirty-age marker
+   is clear. Read these hints under the queue lock rather than racing the
+   core's dirty flag. New =vfs.gefs.agejobs= and =idlesyncs= counters expose
+   queued age jobs and skipped clean passes. In the VM, a 35-second clean
+   pass produced one skip, zero age jobs and zero writes/flushes. After a
+   2 MiB buffered write, the next pass queued one age job and completed an
+   age commit with two flushes; the online filesystem check passed.
 4. *Storage-command coalescing and FUA.* Measure queue drains and contiguous
    writes before adding a coalescer. FUA for superblocks could replace the
    second flush only with verified device support and the same ordering

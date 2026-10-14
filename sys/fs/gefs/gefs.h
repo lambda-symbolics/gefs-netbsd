@@ -97,6 +97,7 @@ struct gefsdev {
 	int		gd_nwq;		/* page writes queued or running */
 	kcondvar_t	gd_wqcv;	/* room in the write queue */
 	struct lwp	*gd_mutlwp;	/* the mutator */
+	int		gd_mactive;	/* mutator running a job or commit; gd_jlk */
 	volatile int	gd_lazyq;	/* a lazy commit is queued */
 	/*
 	 * Commits, gefs_work.c: the mutator runs them, for requests (group
@@ -120,6 +121,8 @@ struct gefsdev {
 	uint64_t	gd_nreq;	/* durability requests (fsync, O_SYNC, sync) */
 	uint64_t	gd_njoin;	/* ... that started no commit of their own */
 	uint64_t	gd_nwhy[GEFS_NWHY];	/* commits run, by reason */
+	uint64_t	gd_nage;	/* syncer age jobs queued; gd_jlk */
+	uint64_t	gd_nidle;	/* clean syncer passes skipped; gd_jlk */
 };
 
 /* One per NetBSD mount: a label of a device. */

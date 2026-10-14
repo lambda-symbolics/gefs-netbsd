@@ -67,6 +67,8 @@ gefs_sysctl_stat(SYSCTLFN_ARGS)
 		case 4: v = f; break;
 		case 5: v = gd->gd_nreq; break;
 		case 6: v = gd->gd_njoin; break;
+		case 12: v = gd->gd_nage; break;
+		case 13: v = gd->gd_nidle; break;
 		default: v = gd->gd_nwhy[which - 7]; break;
 		}
 		q += v;
@@ -76,7 +78,7 @@ gefs_sysctl_stat(SYSCTLFN_ARGS)
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
 
-static int gefs_statsel[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+static int gefs_statsel[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
 
 /* a tunable changed: the mutators re-read it */
 static int
@@ -107,7 +109,7 @@ gefs_sysctl_init(void)
 {
 	static const char *names[] = { "commits", "skipped", "reads", "writes",
 		"flushes", "requests", "joined", "commits_sync", "commits_age",
-		"commits_dirty", "commits_space", "commits_lazy" };
+		"commits_dirty", "commits_space", "commits_lazy", "agejobs", "idlesyncs" };
 	static const char *descr[] = {
 		"commits written", "commits skipped, nothing changed",
 		"blocks read", "blocks written", "device cache flushes",
@@ -115,7 +117,8 @@ gefs_sysctl_init(void)
 		"requests that started no commit of their own",
 		"commits run for requests", "commits run for the interval",
 		"commits run for dirty memory", "commits run for space",
-		"commits run for lazy updates alone" };
+		"commits run for lazy updates alone", "syncer age jobs queued",
+		"clean syncer passes without a mutator wakeup" };
 	static const struct { const char *n, *d; int *v; } tune[] = {
 		{ "interval", "seconds a change may wait for a commit, at most",
 		    &gefs_interval },
@@ -819,6 +822,14 @@ gefs_sync(struct mount *mp, int waitfor, kauth_cred_t cred)
 		mutex_exit(&gd->gd_jlk);
 		return 0;
 	}
+	/* Use queue state under gd_jlk, not the core's unlocked dirty flag. */
+	if(gd->gd_dirtyat == 0 && gd->gd_nwq == 0 && !gd->gd_mactive &&
+	    gd->gd_jtaken == gd->gd_jenq){
+		gd->gd_nidle++;
+		mutex_exit(&gd->gd_jlk);
+		return 0;
+	}
+	gd->gd_nage++;
 	gd->gd_lazyq = 1;
 	mutex_exit(&gd->gd_jlk);
 	gefs_post(gm, gefs_agejob, NULL);

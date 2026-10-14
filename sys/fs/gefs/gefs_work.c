@@ -370,18 +370,22 @@ gefs_mutator(void *arg)
 				gd->gd_cmtflags = 0;
 			}else if(why == GEFS_WLAZY)
 				flags = Clazy;
+			gd->gd_mactive = 1;
 			mutex_exit(&gd->gd_jlk);
 			gefs_runcommit(gd, flags, why);
 			mutex_enter(&gd->gd_jlk);
+			gd->gd_mactive = 0;
 			continue;
 		}
 		if(!TAILQ_EMPTY(&gd->gd_mq)){
 			j = TAILQ_FIRST(&gd->gd_mq);
 			TAILQ_REMOVE(&gd->gd_mq, j, j_link);
 			gd->gd_jtaken++;
+			gd->gd_mactive = 1;
 			mutex_exit(&gd->gd_jlk);
 			gefs_runjob(gd, j);
 			mutex_enter(&gd->gd_jlk);
+			gd->gd_mactive = 0;
 			continue;
 		}
 		if(gd->gd_stop)
