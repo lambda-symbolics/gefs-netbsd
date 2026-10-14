@@ -10,6 +10,7 @@ LINKS=	${BINDIR}/gefs ${BINDIR}/newfs_gefs \
 	${BINDIR}/gefs ${BINDIR}/fsck_gefs
 MLINKS=	gefs.8 newfs_gefs.8 gefs.8 fsck_gefs.8
 
+NETBSDSRCDIR?=	/usr/src	# unset when make runs outside a tree build
 GEFS=	${NETBSDSRCDIR}/sys/fs/gefs
 .PATH:	${GEFS}
 SRCS+=	p9fmt.c p9err.c p9user.c avl.c hash.c pack.c blk.c cache.c tree.c \
