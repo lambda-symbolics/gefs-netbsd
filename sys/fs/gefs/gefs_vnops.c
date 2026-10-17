@@ -1312,6 +1312,16 @@ struct rdctx {
 	size_t	off;
 	off_t	n;	/* entries taken */
 	int	skip;	/* entries to pass over first */
+	/*
+	 * Device nodes whose kind is in an attribute record: their d_type is
+	 * filled in after the scan (gefsdevtype must not run within one).
+	 */
+	struct rddev {
+		size_t	off;	/* of the dirent in buf */
+		vlong	qid;
+	}	*dev;
+	int	ndev;
+	int	maxdev;
 };
 
 static int
@@ -1343,6 +1353,15 @@ rdfill(void *arg, Xdir *d)
 	case Gfifo:	dp->d_type = DT_FIFO;	break;
 	case Gsock:	dp->d_type = DT_SOCK;	break;
 	default:	dp->d_type = DT_REG;	break;
+	}
+	if((d->flag & GEFS_FDEVNOD) && dp->d_type == DT_REG){
+		/* the kind is in the Xrdev attribute: after the scan */
+		if(c->ndev < c->maxdev){
+			c->dev[c->ndev].off = c->off;
+			c->dev[c->ndev].qid = d->qid.path;
+			c->ndev++;
+		}else
+			dp->d_type = DT_UNKNOWN;	/* the caller stats */
 	}
 	memcpy(dp->d_name, d->name, nl);
 	c->off += rl;
@@ -1404,6 +1423,10 @@ gefs_readdir(void *v)
 		return EINVAL;
 	c.len = MIN(uio->uio_resid, 64*1024);
 	c.buf = kmem_alloc(c.len, KM_SLEEP);
+	/* every entry of the buffer could be a device node */
+	c.maxdev = c.len / _DIRENT_RECLEN((struct dirent *)0, 1) + 1;
+	c.dev = kmem_alloc(c.maxdev * sizeof(c.dev[0]), KM_SLEEP);
+	c.ndev = 0;
 	c.off = 0;
 	c.n = off;
 	c.skip = 0;
@@ -1439,6 +1462,21 @@ gefs_readdir(void *v)
 		more = gefsreaddir(gm->gm_mnt, de, s, rdfill, &c);
 		GEFS_END();
 	}
+	if(c.ndev > 0){
+		GEFS_BEGIN(gm, error, out);
+		for(int i = 0; i < c.ndev; i++){
+			struct dirent *dp = (struct dirent *)(c.buf + c.dev[i].off);
+
+			switch(gefsdevtype(gm->gm_mnt, c.dev[i].qid)){
+			case Gchr:	dp->d_type = DT_CHR;	break;
+			case Gblk:	dp->d_type = DT_BLK;	break;
+			case Gfifo:	dp->d_type = DT_FIFO;	break;
+			case Gsock:	dp->d_type = DT_SOCK;	break;
+			default:	dp->d_type = DT_UNKNOWN; break;
+			}
+		}
+		GEFS_END();
+	}
 out:
 	gn->gn_scanoff = c.n;
 	mutex_exit(&gn->gn_scanlk);
@@ -1450,6 +1488,7 @@ done:
 	if(ap->a_eofflag != NULL)
 		*ap->a_eofflag = (error == 0 && !more && c.off < c.len);
 	kmem_free(c.buf, c.len);
+	kmem_free(c.dev, c.maxdev * sizeof(c.dev[0]));
 	return error;
 }
 

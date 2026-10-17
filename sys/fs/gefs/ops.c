@@ -214,6 +214,43 @@ loadextra(Tree *t, Dent *de)
 	}
 }
 
+/*
+ * The type of device node qid, from its Xrdev attribute: a directory entry
+ * only says "device node" (GEFS_FDEVNOD), and readdir needs the kind for
+ * d_type (libudev took /dev/dri/card0 for a regular file and wlroots found
+ * no GPU).  Greg if the attribute is missing.  Not within a scan: call it
+ * after btexit.
+ */
+int
+gefsdevtype(Mount *mnt, vlong qid)
+{
+	char kbuf[Keymax], vbuf[Keymax + 16];
+	int type;
+	Tree *t;
+	Kvp kv;
+	Key k;
+
+	type = Greg;
+	epochstart(0);
+	if(waserror()){
+		epochend(0);
+		nexterror();
+	}
+	t = agetp(&mnt->root);
+	xkey(&k, qid, Xrdev, kbuf, sizeof(kbuf));
+	if(btlookup(t, &k, &kv, vbuf, sizeof(vbuf)) && kv.nv == 12){
+		switch(UNPACK32(kv.v)){
+		case GEFS_DEVBLK:	type = Gblk;	break;
+		case GEFS_DEVCHR:	type = Gchr;	break;
+		case GEFS_DEVSOCK:	type = Gsock;	break;
+		case GEFS_DEVFIFO:	type = Gfifo;	break;
+		}
+	}
+	poperror();
+	epochend(0);
+	return type;
+}
+
 static Dent*
 entdent(Mount *mnt, Tree *t, vlong up, Kvp *kv)
 {

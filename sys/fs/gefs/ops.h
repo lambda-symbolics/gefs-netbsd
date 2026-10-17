@@ -137,6 +137,7 @@ int	gefsisempty(Mount*, Dent*);
 int	gefserrno(char*);
 _Noreturn void	gefserr(char*, ...);
 int	gefsxtype(Xdir*);
+int	gefsdevtype(Mount*, vlong);
 
 /* the environment */
 int	p9devflush(int);
