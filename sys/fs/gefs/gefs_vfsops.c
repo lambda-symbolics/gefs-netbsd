@@ -745,8 +745,14 @@ gefs_statvfs(struct mount *mp, struct statvfs *sbp)
 	sbp->f_bfree = (total - used) / Blksz;
 	sbp->f_bavail = sbp->f_bfree;
 	sbp->f_bresvd = 0;
-	sbp->f_files = f->nextqid;
-	sbp->f_ffree = (Qdump - 1) - f->nextqid;
+	/*
+	 * Qids are a 63-bit space, so "free inodes" is bounded by space, not
+	 * by numbers: at most one new file per free block.  f_files is used
+	 * (qids handed out) plus free, so df -i's used = files - ffree holds
+	 * (it printed negative counts before).
+	 */
+	sbp->f_ffree = MIN((uint64_t)(Qdump - 1) - f->nextqid, sbp->f_bfree);
+	sbp->f_files = f->nextqid + sbp->f_ffree;
 	sbp->f_favail = sbp->f_ffree;
 	sbp->f_fresvd = 0;
 	copy_statvfs_info(sbp, mp);

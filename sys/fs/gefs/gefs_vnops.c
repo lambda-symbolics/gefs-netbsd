@@ -946,7 +946,8 @@ gefs_remove(void *v)
 		error = EPERM;
 	else
 		error = gefs_unlink(dvp, vp, ap->a_cnp);
-	ap->ctx_vp_new_nlink = (error == 0) ? 0 : VTODE(vp)->nlink;
+	/* the links left (other names of the file keep it alive) */
+	ap->ctx_vp_new_nlink = VTODE(vp)->nlink;
 	if(dvp == vp)
 		vrele(vp);
 	else
@@ -1140,7 +1141,14 @@ gefs_gro_rename(struct mount *mp, kauth_cred_t cred,
 	}
 	if(error == 0){
 		if(tvp != NULL)
-			*tvp_nlinkp = 0;
+			*tvp_nlinkp = (tvp->v_type == VDIR) ? 0 :
+			    VTODE(tvp)->nlink;
+		/*
+		 * The directories' name cache too, as gro_rename must: a lookup
+		 * while the generic rename had its locks dropped may have
+		 * cached the target name as absent.
+		 */
+		genfs_rename_cache_purge(fdvp, fvp, tdvp, tvp);
 		cache_purge(fvp);
 		if(tvp != NULL)
 			cache_purge(tvp);
@@ -1157,7 +1165,7 @@ gefs_gro_remove(struct mount *mp, kauth_cred_t cred,
 
 	error = gefs_unlink(dvp, vp, cnp);
 	if(error == 0)
-		*tvp_nlinkp = 0;
+		*tvp_nlinkp = (vp->v_type == VDIR) ? 0 : VTODE(vp)->nlink;
 	return error;
 }
 
@@ -1447,7 +1455,14 @@ gefs_readdir(void *v)
 	}
 	mutex_enter(&gn->gn_scanlk);
 	s = gn->gn_scan;
-	if(s == NULL || gn->gn_scanoff != c.n){
+	/*
+	 * A read from the start (opendir, rewinddir: offset 0..2) always
+	 * restarts.  Emitting "." and ".." brings c.n to 2, which is also where
+	 * a finished scan of an empty directory stopped: comparing with c.n
+	 * alone reused that empty, done scan, and files created later never
+	 * showed (git's objects/pack, a download into an empty ~/Desktop).
+	 */
+	if(off <= 2 || s == NULL || gn->gn_scanoff != c.n){
 		/* not where the last call stopped: start over and skip */
 		if(s == NULL){
 			s = kmem_alloc(sizeof(Scan), KM_SLEEP);
