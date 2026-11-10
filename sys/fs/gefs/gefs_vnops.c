@@ -25,6 +25,7 @@
 #include <sys/lockf.h>
 #include <sys/uio.h>
 #include <sys/fstrans.h>
+#include <sys/atomic.h>
 #include <miscfs/genfs/genfs.h>
 #include <miscfs/specfs/specdev.h>
 #include <miscfs/fifofs/fifo.h>
@@ -800,6 +801,14 @@ gefs_write(void *v)
 		uio->uio_offset = osize;
 	if(uio->uio_offset + uio->uio_resid > (1LL<<62))
 		return EFBIG;
+	/*
+	 * mtime before the copy: the pages put during this write
+	 * (write-behind) and after it carry this value into the tree, so
+	 * stat agrees with what is stored.
+	 */
+	wlock(de);
+	de->mtime = nsec();
+	wunlock(de);
 	nsize = osize;
 	if(uio->uio_offset + uio->uio_resid > osize){
 		off_t rem;
@@ -858,10 +867,6 @@ gefs_write(void *v)
 		uvm_vnp_setsize(vp, vp->v_size);
 		return error;
 	}
-	/* in memory for stat now; the tree gets it when the pages are put */
-	wlock(de);
-	de->mtime = nsec();
-	wunlock(de);
 	if(ioflag & IO_SYNC){
 		rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
 		error = VOP_PUTPAGES(vp, 0, 0, PGO_ALLPAGES | PGO_CLEANIT |
@@ -1631,9 +1636,17 @@ gefs_gop_alloc(struct vnode *vp, off_t off, off_t len, int flags,
 	return 0;
 }
 
+/*
+ * Pages written through a mapping (fault for write, or found modified
+ * when put): the file changed now.  The tree gets this mtime with the
+ * next put of its pages.  Called with the object or interlock held, so
+ * no sleeping lock: a 64-bit store is atomic here.
+ */
 static void
 gefs_gop_markupdate(struct vnode *vp, int flags)
 {
+	if(flags & GOP_UPDATE_MODIFIED)
+		atomic_store_relaxed(&VTODE(vp)->mtime, nsec());
 }
 
 const struct genfs_ops gefs_genfsops = {

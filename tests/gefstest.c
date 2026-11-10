@@ -620,6 +620,47 @@ phase8(void)
 	unmount();
 }
 
+/*
+ * Pages put by the page cache (newsize >= 0) keep the mtime that
+ * write(2), utimes or an mmap fault set; only direct writes stamp their
+ * own.  Flushes used to move mtime forward 30 s after a save (Emacs:
+ * "changed on disk") and undo cp -p.
+ */
+static void
+phase9(void)
+{
+	Dent *f;
+	Gattr at;
+	char buf[8192];
+	vlong t = 1234567890LL*1000000000LL + 123;
+
+	mount();
+	memset(buf, 0x5a, sizeof buf);
+	f = mk(root, "mtime", Greg, 0644);
+	memset(&at, 0, sizeof at);
+	at.mtime = t;
+	gefssetattr(mnt, f, &at, Amtime, 1000);
+	gefswrite(mnt, f, buf, 0, sizeof buf, sizeof buf, 1000);
+	gefsgetattr(f, &at);
+	CHECK(at.mtime == t, "page put changed mtime %lld -> %lld", t, at.mtime);
+	commit(0);
+	clunkdent(mnt, f);
+	unmount();
+
+	mount();
+	f = look(root, "mtime");
+	CHECK(f != nil, "mtime file gone");
+	if(f != nil){
+		gefsgetattr(f, &at);
+		CHECK(at.mtime == t, "stored mtime %lld, want %lld", at.mtime, t);
+		gefswrite(mnt, f, buf, 0, 100, -1, 1000);
+		gefsgetattr(f, &at);
+		CHECK(at.mtime > t, "direct write kept the old mtime");
+		clunkdent(mnt, f);
+	}
+	unmount();
+}
+
 static void
 run(char *name, void (*fn)(void))
 {
@@ -667,6 +708,7 @@ main(int argc, char **argv)
 	run("snapshots after a reload", phase6);
 	run("a full file system", phase7);
 	run("truncate, grow and old data", phase8);
+	run("page puts keep mtime", phase9);
 	fprint(2, failures ? "FAILED\n" : "all passed\n");
 	return failures != 0;
 }

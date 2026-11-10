@@ -841,7 +841,15 @@ gefswrite(Mount *mnt, Dent *de, char *s, vlong off, long n, vlong newsize, int u
 			de->length = o;
 		}
 		sbuf[0] |= Owmtime;
-		de->mtime = nsec();
+		/*
+		 * The page cache puts pages long after write(2) (write-behind,
+		 * the syncer): the mtime is the one write(2), utimes or an mmap
+		 * fault set then.  A flush stamping its own time moved mtime
+		 * forward under stat (Emacs: "changed on disk") and undid
+		 * cp -p, tar and rsync -t.
+		 */
+		if(newsize < 0)
+			de->mtime = nsec();
 		PACK64(p, de->mtime);
 		p += 8;
 		sbuf[0] |= Owmuid;
